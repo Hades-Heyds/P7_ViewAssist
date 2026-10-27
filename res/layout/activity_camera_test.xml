@@ -1,0 +1,157 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@color/bg_deep">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:padding="16dp">
+
+        <TextView
+            android:id="@+id/tv_cam_title"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="摄像头预览选择"
+            android:textColor="@color/text_white"
+            android:textSize="26sp"
+            android:textStyle="bold"
+            android:gravity="center"
+            android:layout_marginBottom="10dp"/>
+
+        <TextView
+            android:id="@+id/tv_cam_index"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="正在预览：- / -"
+            android:textColor="@color/accent_gold"
+            android:textSize="20sp"
+            android:gravity="center"
+            android:layout_marginBottom="10dp"/>
+
+        <!-- 固定比例预览区：竖屏/横屏通用（ScrollView + 固定高度 16:9 区域） -->
+        <FrameLayout
+            android:layout_width="match_parent"
+            android:layout_height="240dp"
+            android:background="@drawable/bg_panel"
+            android:layout_marginBottom="12dp">
+
+            <TextureView
+                android:id="@+id/test_texture"
+                android:layout_width="match_parent"
+                android:layout_height="match_parent"
+                android:layout_margin="2dp"/>
+        </FrameLayout>
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="AVM 视角切换"
+            android:textColor="@color/text_secondary"
+            android:textSize="16sp"
+            android:layout_marginBottom="8dp"/>
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal">
+
+            <Button
+                android:id="@+id/btn_avm_3d"
+                android:layout_width="0dp"
+                android:layout_height="60dp"
+                android:layout_weight="1"
+                android:layout_marginEnd="6dp"
+                android:background="@drawable/bg_button"
+                android:textColor="@color/text_white"
+                android:text="3D 环视"
+                android:textSize="17sp"/>
+
+            <Button
+                android:id="@+id/btn_avm_front"
+                android:layout_width="0dp"
+                android:layout_height="60dp"
+                android:layout_weight="1"
+                android:layout_marginStart="6dp"
+                android:layout_marginEnd="6dp"
+                android:background="@drawable/bg_button"
+                android:textColor="@color/text_white"
+                android:text="2D 前视"
+                android:textSize="17sp"/>
+
+            <Button
+                android:id="@+id/btn_avm_360"
+                android:layout_width="0dp"
+                android:layout_height="60dp"
+                android:layout_weight="1"
+                android:layout_marginStart="6dp"
+                android:background="@drawable/bg_button"
+                android:textColor="@color/text_white"
+                android:text="360 三分屏"
+                android:textSize="17sp"/>
+        </LinearLayout>
+
+        <!-- 自定义视角：输入 display-mode 整数值下发（0/1/8/9 为 AVM 系统内部状态，勿作为固定按钮） -->
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="自定义视角（输入 display-mode 整数值）"
+            android:textColor="@color/text_secondary"
+            android:textSize="16sp"
+            android:layout_marginTop="10dp"
+            android:layout_marginBottom="8dp"/>
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal">
+
+            <EditText
+                android:id="@+id/et_avm_custom"
+                android:layout_width="0dp"
+                android:layout_height="60dp"
+                android:layout_weight="1"
+                android:layout_marginEnd="6dp"
+                android:background="@drawable/bg_panel"
+                android:inputType="numberSigned"
+                android:hint="如 22"
+                android:textColor="@color/text_white"
+                android:textColorHint="@color/text_secondary"
+                android:padding="12dp"
+                android:textSize="18sp"/>
+
+            <Button
+                android:id="@+id/btn_avm_custom"
+                android:layout_width="0dp"
+                android:layout_height="60dp"
+                android:layout_weight="1"
+                android:layout_marginStart="6dp"
+                android:background="@drawable/bg_button"
+                android:textColor="@color/text_white"
+                android:text="下发"
+                android:textSize="18sp"/>
+        </LinearLayout>
+
+        <Button
+            android:id="@+id/btn_dump_avm"
+            android:layout_width="match_parent"
+            android:layout_height="60dp"
+            android:layout_marginTop="10dp"
+            android:background="@drawable/bg_button"
+            android:textColor="@color/text_white"
+            android:text="dump AVM 参数"
+            android:textSize="18sp"/>
+
+        <Button
+            android:id="@+id/btn_back"
+            android:layout_width="match_parent"
+            android:layout_height="60dp"
+            android:layout_marginTop="10dp"
+            android:background="@drawable/bg_button"
+            android:textColor="@color/text_white"
+            android:text="返回主界面"
+            android:textSize="18sp"/>
+    </LinearLayout>
+</ScrollView>

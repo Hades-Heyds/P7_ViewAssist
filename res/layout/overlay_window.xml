@@ -1,0 +1,121 @@
+<?xml version="1.0" encoding="utf-8"?>
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@drawable/bg_panel">
+
+    <TextureView
+        android:id="@+id/overlay_texture"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"/>
+
+    <TextView
+        android:id="@+id/overlay_label"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="top|start"
+        android:layout_margin="10dp"
+        android:background="@drawable/bg_button"
+        android:padding="8dp"
+        android:textColor="@color/text_white"
+        android:textSize="16sp"
+        android:text="摄像头预览"/>
+
+    <!-- v1.46：右上角关闭按钮——打灯结束前可提前关闭浮窗（转向浮窗关闭后进入抑制，防同方向误重开） -->
+    <TextView
+        android:id="@+id/overlay_close"
+        android:layout_width="40dp"
+        android:layout_height="40dp"
+        android:layout_gravity="top|end"
+        android:layout_margin="4dp"
+        android:background="@drawable/bg_button"
+        android:gravity="center"
+        android:textColor="@color/text_white"
+        android:textSize="22sp"
+        android:text="✕"/>
+
+    <!-- v1.32：编辑模式金色描边边框（默认 GONE，编辑模式显示） -->
+    <View
+        android:id="@+id/overlay_border"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:visibility="gone"/>
+
+    <TextView
+        android:id="@+id/overlay_edit_hint"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="bottom|end"
+        android:layout_margin="10dp"
+        android:background="@drawable/bg_button"
+        android:padding="6dp"
+        android:textColor="@color/accent_gold"
+        android:textSize="13sp"
+        android:text="可拖动"/>
+
+    <!-- v1.32：四边裁切手柄（约 18dp 细条贴边，默认 GONE，编辑模式显示，各自可拖动） -->
+    <View
+        android:id="@+id/handle_left"
+        android:layout_width="18dp"
+        android:layout_height="match_parent"
+        android:layout_gravity="start|center_vertical"
+        android:background="#66FFD98A"
+        android:visibility="gone"/>
+
+    <View
+        android:id="@+id/handle_right"
+        android:layout_width="18dp"
+        android:layout_height="match_parent"
+        android:layout_gravity="end|center_vertical"
+        android:background="#66FFD98A"
+        android:visibility="gone"/>
+
+    <View
+        android:id="@+id/handle_top"
+        android:layout_width="match_parent"
+        android:layout_height="18dp"
+        android:layout_gravity="top|center_horizontal"
+        android:background="#66FFD98A"
+        android:visibility="gone"/>
+
+    <View
+        android:id="@+id/handle_bottom"
+        android:layout_width="match_parent"
+        android:layout_height="18dp"
+        android:layout_gravity="bottom|center_horizontal"
+        android:background="#66FFD98A"
+        android:visibility="gone"/>
+
+    <!-- v1.51：四角等比例缩放手柄（24dp 方块贴角，默认 GONE，编辑模式显示，拖动等比例缩放） -->
+    <View
+        android:id="@+id/handle_tl"
+        android:layout_width="24dp"
+        android:layout_height="24dp"
+        android:layout_gravity="top|start"
+        android:background="#66FFD98A"
+        android:visibility="gone"/>
+
+    <View
+        android:id="@+id/handle_tr"
+        android:layout_width="24dp"
+        android:layout_height="24dp"
+        android:layout_gravity="top|end"
+        android:background="#66FFD98A"
+        android:visibility="gone"/>
+
+    <View
+        android:id="@+id/handle_bl"
+        android:layout_width="24dp"
+        android:layout_height="24dp"
+        android:layout_gravity="bottom|start"
+        android:background="#66FFD98A"
+        android:visibility="gone"/>
+
+    <View
+        android:id="@+id/handle_br"
+        android:layout_width="24dp"
+        android:layout_height="24dp"
+        android:layout_gravity="bottom|end"
+        android:background="#66FFD98A"
+        android:visibility="gone"/>
+</FrameLayout>

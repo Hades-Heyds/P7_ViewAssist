@@ -1,0 +1,205 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/scroll_log"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@color/bg_deep">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:padding="20dp">
+
+        <TextView
+            android:id="@+id/title"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="车机打灯联动摄像头视角"
+            android:textColor="@color/text_white"
+            android:textSize="28sp"
+            android:textStyle="bold"
+            android:gravity="center"
+            android:layout_marginBottom="16dp"/>
+
+        <Button
+            android:id="@+id/btn_camera_test"
+            android:layout_width="match_parent"
+            android:layout_height="76dp"
+            android:background="@drawable/bg_button"
+            android:textColor="@color/text_white"
+            android:text="摄像头预览选择：绑定转向灯"
+            android:textSize="22sp"
+            android:layout_marginBottom="12dp"/>
+
+        <Button
+            android:id="@+id/btn_overlay"
+            android:layout_width="match_parent"
+            android:layout_height="76dp"
+            android:background="@drawable/bg_button"
+            android:textColor="@color/text_white"
+            android:text="申请悬浮窗权限"
+            android:textSize="22sp"
+            android:layout_marginBottom="12dp"/>
+
+        <Button
+            android:id="@+id/btn_camera"
+            android:layout_width="match_parent"
+            android:layout_height="76dp"
+            android:background="@drawable/bg_button"
+            android:textColor="@color/text_white"
+            android:text="申请相机权限"
+            android:textSize="22sp"
+            android:layout_marginBottom="12dp"/>
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:layout_marginTop="8dp"
+            android:gravity="center_vertical">
+
+            <TextView
+                android:layout_width="120dp"
+                android:layout_height="wrap_content"
+                android:text="ADB 地址"
+                android:textColor="@color/text_white"
+                android:textSize="20sp"
+                android:gravity="center_vertical"/>
+
+            <EditText
+                android:id="@+id/et_host"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:textSize="20sp"
+                android:textColor="@color/text_white"
+                android:textColorHint="@color/text_secondary"
+                android:background="@drawable/bg_button"
+                android:padding="10dp"
+                android:inputType="text"
+                android:text="127.0.0.1"/>
+        </LinearLayout>
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:layout_marginTop="8dp"
+            android:gravity="center_vertical">
+
+            <TextView
+                android:layout_width="120dp"
+                android:layout_height="wrap_content"
+                android:text="ADB 端口"
+                android:textColor="@color/text_white"
+                android:textSize="20sp"
+                android:gravity="center_vertical"/>
+
+            <EditText
+                android:id="@+id/et_port"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:textSize="20sp"
+                android:textColor="@color/text_white"
+                android:textColorHint="@color/text_secondary"
+                android:background="@drawable/bg_button"
+                android:padding="10dp"
+                android:inputType="number"
+                android:text="5050"/>
+        </LinearLayout>
+
+        <!-- v1.43：打灯联动开关与上方按钮同尺寸（全宽 76dp，22sp） -->
+        <Button
+            android:id="@+id/sw_enable"
+            android:layout_width="match_parent"
+            android:layout_height="76dp"
+            android:background="@drawable/bg_button"
+            android:textColor="@color/text_white"
+            android:text="打灯联动：关闭"
+            android:textSize="22sp"
+            android:layout_marginTop="8dp"/>
+
+        <!-- v1.43：一键还原左右转向浮窗位置/形状/画面缩放到默认，并把绑定视角归位 display-mode=8 -->
+        <Button
+            android:id="@+id/btn_reset_overlay"
+            android:layout_width="match_parent"
+            android:layout_height="60dp"
+            android:background="@drawable/bg_button"
+            android:textColor="@color/accent_gold"
+            android:text="还原浮窗设置（位置/形状/画面/视角）"
+            android:textSize="18sp"
+            android:layout_marginTop="8dp"/>
+
+        <!-- v1.46：右浮窗对齐左浮窗（位置/大小/形状） -->
+        <Button
+            android:id="@+id/btn_align_right_to_left"
+            android:layout_width="match_parent"
+            android:layout_height="60dp"
+            android:background="@drawable/bg_button"
+            android:textColor="@color/text_white"
+            android:text="右浮窗对齐左浮窗（位置/大小/形状）"
+            android:textSize="18sp"
+            android:layout_marginTop="8dp"/>
+
+        <TextView
+            android:id="@+id/tv_state"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="状态：未运行"
+            android:textColor="@color/accent_gold"
+            android:textSize="22sp"
+            android:textStyle="bold"
+            android:layout_marginTop="14dp"/>
+
+        <!-- v1.43：日志模块上方用户使用说明 -->
+        <TextView
+            android:id="@+id/tv_usage_hint"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:background="@drawable/bg_panel"
+            android:padding="12dp"
+            android:layout_marginTop="10dp"
+            android:textColor="@color/text_white"
+            android:textSize="14sp"
+            android:lineSpacingExtra="4dp"
+            android:text="使用说明：\n1. 首次开启「打灯联动」时，车机会弹出 ADB 配对确认，请点击确认；确认后应用会自动重启一次，重新进入即可正常使用。\n2. 浮窗操作：单指拖动浮窗到合适位置（松手自动保存）；双击浮窗进入编辑模式，单指平移画面、双指缩放画面、拖动黄色边缘调整窗口形状，再次双击退出并保存。\n3. 若画面调整乱了调不回来，点击上方「还原浮窗设置」，浮窗位置/形状/画面与绑定视角将全部恢复默认。"/>
+
+        <!-- v1.41：状态日志标题行 + 清空日志按钮 -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:gravity="center_vertical"
+            android:layout_marginTop="12dp">
+
+            <TextView
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:text="状态日志"
+                android:textColor="@color/text_secondary"
+                android:textSize="18sp"/>
+
+            <Button
+                android:id="@+id/btn_clear_log"
+                android:layout_width="wrap_content"
+                android:layout_height="52dp"
+                android:background="@drawable/bg_button"
+                android:textColor="@color/text_white"
+                android:text="清空日志"
+                android:textSize="16sp"/>
+        </LinearLayout>
+
+        <TextView
+            android:id="@+id/tv_log"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:fontFamily="monospace"
+            android:textColor="@color/text_white"
+            android:textSize="14sp"
+            android:lineSpacingExtra="4dp"
+            android:text=""/>
+    </LinearLayout>
+</ScrollView>

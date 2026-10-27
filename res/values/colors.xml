@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- P7Show 深色风格色板 -->
+    <color name="bg_deep">#0A1420</color>
+    <color name="panel_dark">#D9142030</color>
+    <color name="border_light">#47FFFFFF</color>
+    <color name="text_white">#FFFFFF</color>
+    <color name="text_secondary">#C7FFFFFF</color>
+    <color name="accent_gold">#FFD98A</color>
+    <color name="accent_gold_bg">#42FFD278</color>
+    <color name="accent_gold_border">#BFFFD278</color>
+</resources>
