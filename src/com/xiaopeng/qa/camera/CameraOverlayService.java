@@ -53,7 +53,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * 彻底摆脱对 Activity 前台状态的依赖（Android 12+ 后台 startForegroundService 会被拒绝，
  * 服务提前在前台运行才能在其他应用上方弹窗）。
  */
-public class CameraOverlayService extends Service implements SignalMonitor.Listener {
+public class CameraOverlayService extends Service implements SignalMonitor.Listener, SignalGate.Listener {
 
     private static final String TAG = "CameraAssist";
     private static final String CHANNEL_ID = "cameraassist_overlay";
@@ -73,6 +73,15 @@ public class CameraOverlayService extends Service implements SignalMonitor.Liste
     private static final String ACTION_RESET_OVERLAY = "com.xiaopeng.qa.camera.RESET_OVERLAY";
     // v1.46：右浮窗对齐左浮窗（位置/大小/形状）
     private static final String ACTION_ALIGN_RIGHT_TO_LEFT = "com.xiaopeng.qa.camera.ALIGN_RIGHT_TO_LEFT";
+    // v1.52：应用配置（BSD 提醒开关/焦点抑制开关/原厂相机包名），主界面开关改动后推送
+    private static final String ACTION_APPLY_CONFIG = "com.xiaopeng.qa.camera.APPLY_CONFIG";
+    // v1.54：BSD 常显窄条位置一键复位
+    private static final String ACTION_RESET_BSD_POS = "com.xiaopeng.qa.camera.RESET_BSD_POS";
+    // v1.54 beta4：BSD 预警浮窗自定义编辑 / 预警浮窗同步转向灯浮窗 / 单独关闭某侧预警浮窗
+    private static final String ACTION_EDIT_BSD_WARNING = "com.xiaopeng.qa.camera.EDIT_BSD_WARNING";
+    private static final String ACTION_SYNC_BSD_TO_TURN = "com.xiaopeng.qa.camera.SYNC_BSD_TO_TURN";
+    private static final String ACTION_CLOSE_BSD_WINDOW = "com.xiaopeng.qa.camera.CLOSE_BSD_WINDOW";
+    public static final String EXTRA_BSD_SIDE = "bsd_side";
 
     // ---- v1.33：画面与窗口解耦模型 ----
     /** 画面基准宽度 = 屏宽*0.4（即默认窗口宽，不随窗口变化），高度按 16:9。 */
@@ -113,6 +122,12 @@ public class CameraOverlayService extends Service implements SignalMonitor.Liste
     // 若误用作渲染 scale 分母，拖浮窗边框改窗口形状时画面比例会跟着窗口变形。----
     private int bufferW = BUFFER_W;
     private int bufferH = BUFFER_H;
+
+    // ---- v1.57 beta3：仪表 H.264 投影（ICLinkProjector）----
+    private final ICLinkProjector icProjector = new ICLinkProjector();
+    private boolean iclProjectionEnabled = true;
+    private String iclIp = ICLinkProjector.DEFAULT_HOST;
+    private int iclPort = ICLinkProjector.DEFAULT_PORT;
 
     // ---- v1.33：编辑模式（LEFT/RIGHT 转向浮窗；MANUAL 手动浮窗保持 v1.31 可拖动现状）----
     /** 当前浮窗是否处于编辑模式（金色描边 + 四边边缘手柄 + 单指拖动/双指缩放画面）。 */
@@ -162,6 +177,86 @@ public class CameraOverlayService extends Service implements SignalMonitor.Liste
     private SignalMonitor monitor;
     private AdbClient adb;
     private Handler mainHandler;
+
+    // ---- v1.52：SignalGate 慢变量门控 / BSD 旁路 / Camera1 回退 / R 挡退出延时抑制 ----
+    private SignalGate signalGate;
+    private SideWarning sideWarning;
+    private Camera1Preview camera1Preview;
+    /** BSD 提醒开关（偏好 bsd_warning_enabled，默认 false）。 */
+    private boolean bsdWarningEnabled = false;
+    /** R 挡退出延时抑制窗口时长（ms，偏好 r_exit_suppress_ms，默认 2000）。 */
+    private long rExitSuppressMs = 2000L;
+    /** R 挡退出延时抑制窗口截止时间戳（ms）；0=无窗口。 */
+    private long rExitSuppressUntilMs = 0L;
+    /** 用于 R 挡 3->非3 边沿检测的上一轮 gearLevel（仅当解析到 GEARLEV 才更新）。 */
+    private int lastGearForRExit = -1;
+    /** v1.53 beta2：BSD 无车常显开关（偏好 bsd_show_always，默认 false），
+     * 开启时 SideWarning 无车也显示调试样式，便于拖动调位置。 */
+    private boolean bsdShowAlways = false;
+    // ---- v1.54：BSD 预警自动弹窗（最低优先级） ----
+    /** BSD 预警自动弹窗开关（偏好 bsd_auto_overlay，默认 true）：开启后检测
+     * SCU_BSD_LEFT_WARNING/RIGHT_WARNING 0->1 边沿自动弹对应侧摄像头浮窗，
+     * 预警熄灭后自动关闭对应侧；优先级最低，不干扰打灯/倒车/窄路辅助。 */
+    private boolean bsdAutoOverlay = true;
+    /** v1.54 beta3：BSD 预警浮窗红色遮罩开关（偏好 bsd_red_overlay，默认 true）：
+     * 开启时预警弹窗边界加一小圈向内的半透明红色遮罩（示意预警状态）；
+     * 仅 BSD 预警弹窗显示，打灯浮窗/手动浮窗不显示。 */
+    private boolean bsdRedOverlay = true;
+    /** 上一轮 BSD 预警状态（左/右），用于 0->1 边沿检测与日志去抖。 */
+    private boolean lastBsdLeft = false;
+    private boolean lastBsdRight = false;
+    /** v1.56 beta1：打灯浮窗联动 BSD 红框的边沿跟踪（上一轮左右 BSD 状态），
+     * 由 onSignalTick 实时调用 onBsdEdgeForTurn 叠加/移除红框使用；
+     * 打灯浮窗不在显示或红框开关关闭时复位，避免重入浮窗时误叠加。 */
+    private boolean lastTurnBsdLeft = false;
+    private boolean lastTurnBsdRight = false;
+    /** 当前由 BSD 自动弹窗激活的浮窗方向（"LEFT"/"RIGHT"/null）。打灯/手动等更高优先级
+     * 接管时置 null 让位；BSD 预警全灭时关闭对应侧浮窗。 */
+    private String bsdAutoActiveDir = null;
+    /** 以 BSD 自动弹窗身份调用 showOverlayForDirection 的临时标记：跳过打灯幂等锁与
+     * lastActiveDir 写入，避免 BSD 弹窗污染打灯方向锁。 */
+    private boolean bsdAutoCalling = false;
+    // ---- v1.54：BSD 双窗避让（左右同时预警时右窗紧挨左窗右侧，不重叠） ----
+    /** BSD 双窗时右窗与左窗的间距（dp）。 */
+    private static final int BSD_DUAL_GAP_DP = 8;
+    /** BSD 双窗场景的右侧浮窗（复用 overlay_window 布局，只读展示，不参与拖动/编辑）。 */
+    private View bsdRightOverlayView = null;
+    private TextureView bsdRightTextureView = null;
+    private TextView bsdRightLabelView = null;
+    private Surface bsdRightSurface = null;
+    /** BSD 右窗当前是否显示。 */
+    private boolean bsdRightOverlayShowing = false;
+    /** 当前预览会话是否为“双 surface”模式（主窗 + BSD 右窗），true 时 createPreviewSession 同时输出两路。 */
+    private boolean dualSessionTargets = false;
+    // ---- v1.54 beta4：BSD 预警浮窗自定义编辑（独立 bsd_ 前缀键，左右各自独立） ----
+    /** BSD 预警编辑态是否激活（主界面「编辑预警浮窗」按钮召唤；再次点击同时关闭并保存）。 */
+    private boolean bsdEditActive = false;
+    /** v1.54 beta6：BSD 编辑态是否由本服务独立启动摄像头预览（无打灯/BSD/手动浮窗归属）。 */
+    private boolean bsdEditPreviewActive = false;
+    /** v1.54 beta6：进入编辑态独立启动预览前的原 direction，退出编辑时恢复。 */
+    private String savedDirectionBeforeEdit = null;
+    /** BSD 左/右预警编辑浮窗（复用 overlay_window 布局，独立可拖动/双击编辑/右上角关闭）。 */
+    private BsdEditWindow bsdEditLeft = null;
+    private BsdEditWindow bsdEditRight = null;
+    // ---- v1.53：AVM 画面守护 / 焦点解析日志 ----
+    /** AVM 绑定视角守护重发间隔（ms）：打灯浮窗存活期间节流重发抵抗外部抢占。 */
+    private static final long AVM_REFRESH_INTERVAL_MS = 1500L;
+    /** 最近一次 AVM 守护重发时间戳（ms），0=未重发过。 */
+    private long lastAvmRefreshMs = 0L;
+    /** 焦点解析日志节流：记录上次上屏的包名与命中，仅在变化时上屏防刷屏。 */
+    private String lastFocusLogPkg = null;
+    private boolean lastFocusLogHit = false;
+    // ---- v1.56 beta3：窄路辅助主动收起 / 退出恢复 ----
+    /** 上一轮窄路辅助窗口在屏状态（裸包名窗口 com.xiaopeng.xmart.camera），用于 0->1/1->0 边沿检测。 */
+    private boolean lastNarrowAssistActive = false;
+    /** 窄路辅助激活时正在显示的打灯方向快照（"LEFT"/"RIGHT"/null），窄路消失后据此恢复打灯浮窗。 */
+    private String narrowTurnDirSnapshot = null;
+    /** 窄路辅助期间打灯转向信号是否仍亮（onSignalChanged 熄灭回调置 false，亮起回调置 true）。 */
+    private boolean narrowTurnStillOn = false;
+    /** 窄路辅助退出恢复后的防抖抑制窗口截止时间戳（ms），窗口内窄路再现不重复收起，防抖动循环。 */
+    private long narrowExitSuppressUntilMs = 0L;
+    /** 窄路辅助退出恢复防抖窗口时长（ms，参考 R 挡退出 2000ms 抑制机制）。 */
+    private static final long NARROW_EXIT_SUPPRESS_MS = 2000L;
 
     /** 启动前台服务。后台场景可能抛 ForegroundServiceStartNotAllowedException，此处捕获并返回是否
      * 启动成功，由调用方决定延后补启，确保任何生命周期状态下都不会因启动服务导致进程崩溃。 */
@@ -221,6 +316,59 @@ public class CameraOverlayService extends Service implements SignalMonitor.Liste
     public static void alignRightToLeft(Context ctx) {
         Intent i = new Intent(ctx, CameraOverlayService.class);
         i.setAction(ACTION_ALIGN_RIGHT_TO_LEFT);
+        safeStart(ctx, i);
+    }
+
+    /**
+     * v1.52/v1.53 beta2/v1.54 beta4：应用慢变量门控配置（BSD 提醒开关 /
+     * BSD 无车常显开关 / BSD 自动弹窗开关 / BSD 预警红色遮罩开关）。
+     * v1.54 beta4：焦点抑制与原厂相机包名功能停用，不再写入/读取相关 prefs。
+     * MainActivity 的开关改动后调用：写入 prefs 并推送 ACTION_APPLY_CONFIG
+     * 让常驻服务即时生效（服务可能因未联动/手动浮窗而存续，直接改 prefs 不会被读取）。
+     */
+    public static void applyConfig(Context ctx, boolean bsdOn,
+                                   boolean bsdShowAlways, boolean bsdAutoOverlay,
+                                   boolean bsdRedOverlay) {
+        SharedPreferences.Editor ed = ctx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit();
+        ed.putBoolean("bsd_warning_enabled", bsdOn);
+        ed.putBoolean("bsd_show_always", bsdShowAlways);
+        ed.putBoolean("bsd_auto_overlay", bsdAutoOverlay);
+        ed.putBoolean("bsd_red_overlay", bsdRedOverlay);
+        ed.apply();
+        Intent i = new Intent(ctx, CameraOverlayService.class);
+        i.setAction(ACTION_APPLY_CONFIG);
+        safeStart(ctx, i);
+    }
+
+    /** v1.54：BSD 常显窄条位置一键复位：清除 bsd_left/right_x/y 持久化键并恢复默认位置。 */
+    public static void resetBsdPositions(Context ctx) {
+        Intent i = new Intent(ctx, CameraOverlayService.class);
+        i.setAction(ACTION_RESET_BSD_POS);
+        safeStart(ctx, i);
+    }
+
+    /** v1.54 beta4：召唤/关闭 BSD 预警浮窗编辑态（主界面「编辑预警浮窗」按钮调用）。
+     * 未召唤时同时召唤左右预警浮窗进入可编辑状态；已召唤时同时关闭并保存两侧配置。 */
+    public static void editBsdWarning(Context ctx) {
+        Intent i = new Intent(ctx, CameraOverlayService.class);
+        i.setAction(ACTION_EDIT_BSD_WARNING);
+        safeStart(ctx, i);
+    }
+
+    /** v1.54 beta4：预警浮窗同步转向灯浮窗（左对左、右对右：位置/大小/画面 pan 缩放）。 */
+    public static void syncBsdToTurn(Context ctx) {
+        Intent i = new Intent(ctx, CameraOverlayService.class);
+        i.setAction(ACTION_SYNC_BSD_TO_TURN);
+        safeStart(ctx, i);
+    }
+
+    /** v1.54 beta4：单独关闭某侧 BSD 预警编辑浮窗并保存该侧配置（编辑窗右上角按钮）。 */
+    public static void closeBsdWindow(Context ctx, String side) {
+        Intent i = new Intent(ctx, CameraOverlayService.class);
+        i.setAction(ACTION_CLOSE_BSD_WINDOW);
+        if (side != null) {
+            i.putExtra(EXTRA_BSD_SIDE, side);
+        }
         safeStart(ctx, i);
     }
 
@@ -286,6 +434,10 @@ public class CameraOverlayService extends Service implements SignalMonitor.Liste
         bgThread.start();
         bgHandler = new Handler(bgThread.getLooper());
         createNotificationChannel();
+        // v1.52：读取慢变量门控相关偏好；signalGate 在联动开启（startLinkInternal）时随 adb 启动
+        loadConfigPrefs();
+        signalGate = new SignalGate(this);
+        sideWarning = new SideWarning(this, wm);
         serviceLog("前台服务已常驻（后台可弹窗）");
     }
 
@@ -323,6 +475,17 @@ public class CameraOverlayService extends Service implements SignalMonitor.Liste
             resetOverlayDefaultsInternal();
         } else if (ACTION_ALIGN_RIGHT_TO_LEFT.equals(action)) {
             alignRightToLeftInternal();
+        } else if (ACTION_APPLY_CONFIG.equals(action)) {
+            applyConfigInternal();
+        } else if (ACTION_RESET_BSD_POS.equals(action)) {
+            resetBsdPositionsInternal();
+        } else if (ACTION_EDIT_BSD_WARNING.equals(action)) {
+            toggleBsdEditInternal();
+        } else if (ACTION_SYNC_BSD_TO_TURN.equals(action)) {
+            syncBsdToTurnInternal();
+        } else if (ACTION_CLOSE_BSD_WINDOW.equals(action)) {
+            String side = intent.getStringExtra(EXTRA_BSD_SIDE);
+            closeBsdEditWindowInternal(side);
         }
         return START_STICKY;
     }
@@ -344,6 +507,15 @@ public class CameraOverlayService extends Service implements SignalMonitor.Liste
             monitor = new SignalMonitor(adb, this, 300);
             if (monitor.start()) {
                 linkActive.set(true);
+                // v1.52：联动开启时同步启动 SignalGate 慢变量轮询（BSD/AVM/挡位冗余）
+                // v1.54 beta4：焦点抑制停用，不再下发原厂相机包名列表
+                if (signalGate != null) {
+                    signalGate.start(adb);
+                }
+                // v1.52：BSD 提醒开启时挂载盲区窄条
+                if (bsdWarningEnabled && sideWarning != null) {
+                    sideWarning.attach();
+                }
                 serviceLog("联动已开启，ADB 轮询启动 (" + host + ":" + port + ")");
                 updateNotificationText("联动轮询运行中 · 转向灯弹窗就绪");
             } else {
@@ -362,6 +534,13 @@ public class CameraOverlayService extends Service implements SignalMonitor.Liste
         if (monitor != null) {
             monitor.stop();
             monitor = null;
+        }
+        // v1.52：联动关闭时同步停止 SignalGate 慢变量轮询并摘除 BSD 窄条
+        if (signalGate != null) {
+            signalGate.stop();
+        }
+        if (sideWarning != null) {
+            sideWarning.detach();
         }
         if (adb != null) {
             adb = null;
@@ -474,6 +653,10 @@ public class CameraOverlayService extends Service implements SignalMonitor.Liste
                         serviceLog("检测到换方向打灯（" + direction + "），解除关闭抑制并重新召唤浮窗");
                         closeSuppressedDir = null;
                     }
+                    // v1.56 beta3：记录窄路恢复打灯快照（方向 + 仍亮标记）。窄路辅助窗口在屏期间
+                    // 打灯亮起会被 showOverlayForDirection 抑制不弹窗，窄路消失后据此恢复打灯浮窗。
+                    narrowTurnDirSnapshot = direction;
+                    narrowTurnStillOn = true;
                     String label = "LEFT".equals(direction) ? "左转向灯" : "右转向灯";
                     serviceLog(label + " 亮起，弹出侧边摄像头悬浮窗");
                     showOverlayForDirection(direction);
@@ -484,6 +667,8 @@ public class CameraOverlayService extends Service implements SignalMonitor.Liste
                         serviceLog("检测到1秒熄灭信号，解除关闭抑制");
                         closeSuppressedDir = null;
                     }
+                    // v1.56 beta3：打灯熄灭清除窄路恢复快照的“仍亮”标记，窄路消失不再恢复打灯浮窗。
+                    narrowTurnStillOn = false;
                     serviceLog("转向灯熄灭，关闭悬浮窗");
                     hideOverlayAndCamera();
                 }
@@ -524,17 +709,725 @@ public class CameraOverlayService extends Service implements SignalMonitor.Liste
         }
     }
 
+    // ---- v1.52：慢变量门控配置加载 / 应用 / 回调 ----
+
+    private void loadConfigPrefs() {
+        SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+        bsdWarningEnabled = prefs.getBoolean("bsd_warning_enabled", false);
+        bsdShowAlways = prefs.getBoolean("bsd_show_always", false);
+        bsdAutoOverlay = prefs.getBoolean("bsd_auto_overlay", true);
+        bsdRedOverlay = prefs.getBoolean("bsd_red_overlay", true);
+        rExitSuppressMs = prefs.getLong("r_exit_suppress_ms", 2000L);
+        if (rExitSuppressMs < 0) rExitSuppressMs = 2000L;
+        // v1.57 beta3：仪表 H.264 投影开关/地址（主界面无 UI，仅保留 prefs 钩子供调试）
+        iclProjectionEnabled = prefs.getBoolean("icl_projection_enable", true);
+        iclIp = prefs.getString("icl_ip", ICLinkProjector.DEFAULT_HOST);
+        iclPort = prefs.getInt("icl_port", ICLinkProjector.DEFAULT_PORT);
+    }
+
+    /** ACTION_APPLY_CONFIG：重新加载偏好并即时生效（BSD 窄条挂载/摘除）。v1.54 beta4 不再下发焦点包名。 */
+    private void applyConfigInternal() {
+        loadConfigPrefs();
+        if (bsdWarningEnabled) {
+            if (sideWarning != null && linkActive.get()) {
+                sideWarning.attach();
+            }
+        } else {
+            if (sideWarning != null) {
+                sideWarning.detach();
+            }
+        }
+        serviceLog("配置已应用：BSD提醒=" + bsdWarningEnabled
+                + " BSD常显=" + bsdShowAlways + " BSD自动弹窗=" + bsdAutoOverlay
+                + " BSD红遮罩=" + bsdRedOverlay);
+    }
+
+    /** v1.54 beta4：焦点抑制已停用，抑制判定方法移除（不再判断原厂相机前台）。 */
+
+    /** SignalGate.Listener：500ms 慢变量快照回调（在轮询线程内触发，转主线程处理）。 */
+    @Override
+    public void onSignalTick(final SignalGate.Snapshot s) {
+        mainHandler.post(new Runnable() {
+            @Override
+            public void run() {
+                if (sideWarning != null) {
+                    sideWarning.update(s, bsdShowAlways);
+                }
+                // v1.56 beta3：窄路辅助窗口边沿检测（裸包名窗口 com.xiaopeng.xmart.camera，
+                // SignalGate 1s 降频检测）。
+                // 出现边沿（0->1）：窄路辅助在屏 → 主动收起已显示浮窗（打灯/BSD 主浮窗经
+                // hideOverlayAndCamera 并清 AVM 绑定状态，BSD 右独立窗经 hideBsdRightOverlay），
+                // 收起前打灯浮窗若处于 AVM 绑定路径（已下发 mode=8）则 sendAvmMode 恢复 360 全景默认。
+                // 消失边沿（1->0）：解除抑制后按当前状态恢复——打灯信号仍亮恢复打灯浮窗
+                //（showOverlayForDirection 自动下发 mode=8）；BSD 对应侧仍为 1 则按当前电平恢复
+                // 弹窗（BSD 边沿触发特性导致窄路期间上升沿被抑制后无新沿，须按电平直接恢复），
+                // 恢复后进入 2s 防抖窗口，窗口内窄路再现不重复收起。
+                long nowMs = System.currentTimeMillis();
+                boolean narrow = s.narrowAssistActive;
+                if (narrow && !lastNarrowAssistActive) {
+                    lastNarrowAssistActive = true;
+                    if (nowMs < narrowExitSuppressUntilMs) {
+                        serviceLog("窄路辅助窗口出现（退出恢复防抖窗口内，不重复收起）");
+                    } else {
+                        collectNarrowAssistOverlays();
+                    }
+                } else if (!narrow && lastNarrowAssistActive) {
+                    lastNarrowAssistActive = false;
+                    restoreAfterNarrowExit(s);
+                    narrowExitSuppressUntilMs = nowMs + NARROW_EXIT_SUPPRESS_MS;
+                }
+                // v1.54：BSD 预警自动弹窗（最低优先级）——检测 SCU_BSD_LEFT/RIGHT_WARNING 0->1
+                // 边沿弹对应侧摄像头浮窗；BSD 预警熄灭且由 BSD 弹起时关闭对应侧浮窗。
+                // 开关关闭时复位状态并释放由 BSD 弹起的浮窗。更高优先级（打灯/倒车/窄路）
+                // 的抑制在 onBsdEdge 内部判定。
+                if (bsdAutoOverlay) {
+                    boolean bsdL = s.bsdLeft;
+                    boolean bsdR = s.bsdRight;
+                    if (bsdL && !lastBsdLeft) {
+                        serviceLog("BSD 预警: 左侧 0->1，请求自动弹左摄像头");
+                        onBsdEdge("LEFT", true);
+                    } else if (!bsdL && lastBsdLeft) {
+                        onBsdEdge("LEFT", false);
+                        if ("LEFT".equals(bsdAutoActiveDir)) {
+                            serviceLog("BSD 预警: 左侧熄灭，关闭 BSD 左浮窗");
+                        }
+                    }
+                    if (bsdR && !lastBsdRight) {
+                        serviceLog("BSD 预警: 右侧 0->1，请求自动弹右摄像头");
+                        onBsdEdge("RIGHT", true);
+                    } else if (!bsdR && lastBsdRight) {
+                        onBsdEdge("RIGHT", false);
+                        if ("RIGHT".equals(bsdAutoActiveDir)) {
+                            serviceLog("BSD 预警: 右侧熄灭，关闭 BSD 右浮窗");
+                        }
+                    }
+                    lastBsdLeft = bsdL;
+                    lastBsdRight = bsdR;
+                    // v1.56 beta1：右独立窗稳态补弹——右侧 BSD 预警中但右独立窗未显示
+                    // （右先亮、右窗创建失败、或任何路径漏建）且左侧处于 BSD 左显示态时，
+                    // 补建右独立窗实现左右双开（showBsdRightOverlay 幂等，创建失败下轮重试）。
+                    if (bsdR && !bsdRightOverlayShowing && bsdRightOverlayView == null
+                            && !bsdEditActive) {
+                        boolean leftBsdDisplayed = "LEFT".equals(bsdAutoActiveDir)
+                                || (direction != null && "LEFT".equals(direction)
+                                    && lastActiveDir == null && !"MANUAL".equals(direction));
+                        if (leftBsdDisplayed) {
+                            showBsdRightOverlay();
+                        }
+                    }
+                } else {
+                    lastBsdLeft = false;
+                    lastBsdRight = false;
+                    if (bsdAutoActiveDir != null) {
+                        serviceLog("BSD 自动弹窗开关已关闭，释放 BSD 弹起浮窗");
+                        releaseBsdAutoOverlay();
+                    }
+                }
+                // v1.56 beta1：打灯浮窗联动 BSD 红框实时化——bsd_red_overlay 开关开启、
+                // 打灯浮窗显示中（lastActiveDir 非 MANUAL 且非 null）、BSD 自动弹窗未占用时，
+                // 左右 BSD 信号 0->1/1->0 边沿实时调用 onBsdEdgeForTurn 叠加/移除对应侧红框；
+                // 条件不满足（开关关闭/无打灯浮窗/BSD 弹窗占用）时复位边沿跟踪状态。
+                if (bsdRedOverlay && lastActiveDir != null && !"MANUAL".equals(lastActiveDir)
+                        && bsdAutoActiveDir == null) {
+                    boolean turnL = s.bsdLeft;
+                    boolean turnR = s.bsdRight;
+                    if (turnL && !lastTurnBsdLeft) {
+                        onBsdEdgeForTurn("LEFT", true);
+                    } else if (!turnL && lastTurnBsdLeft) {
+                        onBsdEdgeForTurn("LEFT", false);
+                    }
+                    if (turnR && !lastTurnBsdRight) {
+                        onBsdEdgeForTurn("RIGHT", true);
+                    } else if (!turnR && lastTurnBsdRight) {
+                        onBsdEdgeForTurn("RIGHT", false);
+                    }
+                    lastTurnBsdLeft = turnL;
+                    lastTurnBsdRight = turnR;
+                } else {
+                    lastTurnBsdLeft = false;
+                    lastTurnBsdRight = false;
+                }
+                // v1.53：焦点解析上屏日志（仅 pkg/hit 变化时打，避免 500ms 刷屏淹没 50 行日志窗）
+                if (s.focusPkg != null
+                        && (!s.focusPkg.equals(lastFocusLogPkg) || s.focusHit != lastFocusLogHit)) {
+                    lastFocusLogPkg = s.focusPkg;
+                    lastFocusLogHit = s.focusHit;
+                    serviceLog("焦点解析: pkg=" + s.focusPkg + " hit=" + s.focusHit);
+                }
+                long now = System.currentTimeMillis();
+                // v1.53：R 挡进行中持续刷新抑制窗口 —— gearLevel==3 期间打灯同样不弹浮窗，
+                // 且退出后仍保留 rExitSuppressMs 延时窗口（下方边沿逻辑兜底）。
+                if (s.gearLevel == 3) {
+                    rExitSuppressUntilMs = now + rExitSuppressMs;
+                }
+                // R 挡退出边沿（3 -> 非3）检测：仅当本轮明确解析到 GEARLEV 才更新状态，
+                // 容错态（-1）保持上一轮，避免格式缺失误判退出。
+                if (s.gearLevel != -1 && lastGearForRExit != -1
+                        && lastGearForRExit == 3 && s.gearLevel != 3) {
+                    rExitSuppressUntilMs = now + rExitSuppressMs;
+                    serviceLog("检测到 R 挡退出（3 -> " + s.gearLevel + "），进入 "
+                            + rExitSuppressMs + "ms 打灯抑制窗口");
+                    // v1.53：倒车退出边沿且打灯浮窗存活（AVM 绑定视角路径）→ 立即补发 display-mode=8
+                    // 刷新画面源，抵抗外部抢占了 AVM 视角导致的画面残留/带偏。
+                    if (overlayView != null && avmModeActive) {
+                        sendAvmMode(8);
+                        lastAvmRefreshMs = now;
+                        serviceLog("AVM 守护：倒车退出边沿立即补发 display-mode=8");
+                    }
+                }
+                if (s.gearLevel != -1) {
+                    lastGearForRExit = s.gearLevel;
+                }
+                // v1.53：AVM 画面守护（节流重发）—— 打灯浮窗存活且检测到 AVM 显示模式被抢占
+                // （解析到且 != 8）时，约 1.5s 一次重发 sendAvmMode(8) 夺回绑定视角。
+                if (overlayView != null && avmModeActive
+                        && s.avmDisplayMode != -1 && s.avmDisplayMode != 8
+                        && now - lastAvmRefreshMs >= AVM_REFRESH_INTERVAL_MS) {
+                    lastAvmRefreshMs = now;
+                    sendAvmMode(8);
+                    serviceLog("AVM 守护：检测到显示模式被抢占（mode=" + s.avmDisplayMode
+                            + "），重发 display-mode=8");
+                }
+            }
+        });
+    }
+
+    /** Camera1 回退钩子：Camera2 打开失败时若偏好 camera1_fallback=true 且纹理就绪，尝试 Camera1 预览。 */
+    private void tryCamera1Fallback() {
+        if (!getSharedPreferences(PREFS_NAME, MODE_PRIVATE).getBoolean("camera1_fallback", false)) {
+            return;
+        }
+        if (textureView == null || textureView.getSurfaceTexture() == null) {
+            Log.e(TAG, "camera1 fallback: textureView not ready");
+            return;
+        }
+        try {
+            camera1Preview = new Camera1Preview(textureView.getSurfaceTexture(), BUFFER_W, BUFFER_H);
+            if (camera1Preview.open()) {
+                serviceLog("Camera2 打开失败，已回退 Camera1 预览（Phase 2 验证态）");
+            } else {
+                serviceLog("Camera1 回退失败，浮窗仅保留静态画面");
+                camera1Preview = null;
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "camera1 fallback error", e);
+            camera1Preview = null;
+        }
+    }
+
+    // ---- v1.54：BSD 预警自动弹窗（最低优先级） ----
+
+    /** BSD 最低优先级抑制判定：打灯/其它方向浮窗激活中、手动浮窗显示中、R 挡倒车显示中、
+     * 窄路辅助动态窗口在屏 → 一律抑制 BSD 自动弹窗（BSD 仅在这些更高优先级缺席时弹出）。 */
+    private boolean shouldSuppressBsdAuto() {
+        if (signalGate != null) {
+            SignalGate.Snapshot s = signalGate.snapshot();
+            if (s.narrowAssistActive) {
+                serviceLog("BSD 自动弹窗：窄路辅助动态窗口在屏，抑制不弹浮窗");
+                return true;
+            }
+            if (s.gearLevel == 3) {
+                serviceLog("BSD 自动弹窗：R 挡倒车显示中（gearLevel=3），抑制不弹浮窗");
+                return true;
+            }
+        }
+        if (lastActiveDir != null && !"MANUAL".equals(lastActiveDir)) {
+            serviceLog("BSD 自动弹窗：打灯/其它方向浮窗激活中（" + lastActiveDir + "），抑制不弹浮窗");
+            return true;
+        }
+        if (manualVisible.get()) {
+            serviceLog("BSD 自动弹窗：手动浮窗显示中，抑制不弹浮窗");
+            return true;
+        }
+        return false;
+    }
+
+    /** BSD 边沿回调（主线程）：rising=true 为 SCU_BSD_*_WARNING 0->1 预警上升沿，false 为 1->0 熄灭沿。 */
+    private void onBsdEdge(String dir, boolean rising) {
+        if (!rising) {
+            // 熄灭沿：若该侧浮窗由 BSD 弹起则关闭对应侧（沿用打灯去抖关闭逻辑）
+            if (dir.equals(bsdAutoActiveDir)) {
+                bsdAutoActiveDir = null;
+                if (lastActiveDir != null && !"MANUAL".equals(lastActiveDir)) {
+                    // 更高优先级（打灯/手动）已接管主浮窗，仅清 BSD 归属标记，不关浮窗
+                    return;
+                }
+                hideOverlayAndCamera();
+                serviceLog("BSD 自动弹窗：BSD 预警熄灭，已关闭 " + dir + " 摄像头浮窗");
+            }
+            if ("RIGHT".equals(dir) && bsdRightOverlayShowing) {
+                hideBsdRightOverlay();
+                serviceLog("BSD 自动弹窗：右侧预警熄灭，已关闭 BSD 右浮窗");
+            }
+            return;
+        }
+        // 上升沿：最低优先级抑制判定（打灯/倒车/窄路/手动占用时不弹）
+        if (shouldSuppressBsdAuto()) {
+            return;
+        }
+        if ("LEFT".equals(dir)) {
+            // v1.56 beta1：右侧 BSD 主浮窗显示中（bsdAutoActiveDir=="RIGHT" 且相机就绪）时，
+            // 先把右侧画面转为右独立窗显示，再执行左上升沿逻辑，实现左主浮窗+右独立窗双开，
+            // 避免左上升沿覆盖 direction 导致右侧显示消失（先建右窗、后切左方向，右侧画面持续显示）。
+            if ("RIGHT".equals(bsdAutoActiveDir)
+                    && overlayView != null && cameraDevice != null) {
+                showBsdRightOverlay();
+                bsdAutoActiveDir = null;
+                serviceLog("BSD 自动弹窗：左预警到来，右侧先转为 BSD 右独立窗显示，再切左主浮窗（双开）");
+            }
+            // 左预警：弹出左摄像头浮窗（等同打灯左浮窗逻辑）
+            bsdAutoActiveDir = "LEFT";
+            bsdAutoCalling = true;
+            showOverlayForDirection("LEFT");
+            bsdAutoCalling = false;
+            // v1.54 beta3：BSD 预警弹窗边界加红色遮罩（示意预警状态，仅预警弹窗显示）
+            showRedOverlayOn(overlayView);
+            // v1.54 beta4：左预警应用用户编辑保存的 bsd_left_ 键（位置/大小/画面），未编辑跳过
+            applyBsdLeftConfigIfPresent();
+        } else {
+            // 右预警：左右同时预警（BSD 双开）→ 弹独立只读右窗（避让公式）；
+            // 仅右预警 → 弹出右摄像头主浮窗（等同打灯右浮窗逻辑）
+            if (signalGate != null && signalGate.snapshot().bsdLeft) {
+                showBsdRightOverlay();
+            } else {
+                bsdAutoActiveDir = "RIGHT";
+                bsdAutoCalling = true;
+                showOverlayForDirection("RIGHT");
+                bsdAutoCalling = false;
+                // v1.54 beta3：仅右预警（主浮窗）同样加红色遮罩
+                showRedOverlayOn(overlayView);
+            }
+        }
+    }
+
+    /** 开关关闭/服务清理时释放由 BSD 弹起的全部浮窗（右窗无条件移除，主窗仅当归属 BSD 时关闭）。 */
+    private void releaseBsdAutoOverlay() {
+        hideBsdRightOverlay();
+        if (bsdAutoActiveDir != null) {
+            bsdAutoActiveDir = null;
+            if (lastActiveDir == null || "MANUAL".equals(lastActiveDir)) {
+                hideOverlayAndCamera();
+            }
+        }
+    }
+
+    /**
+     * v1.56 beta3：窄路辅助窗口出现边沿——主动收起已显示浮窗。
+     * 1) 打灯浮窗（lastActiveDir 非 MANUAL）：记录恢复快照后经 hideOverlayAndCamera 收起并清
+     *    avmModeActive；收起前若处于 AVM 绑定路径（avmModeActive==true，已下发 display-mode=8）
+     *    则补发 sendAvmMode(8) 恢复 360 全景默认视角。
+     * 2) BSD 主浮窗（bsdAutoActiveDir 非 null）：清归属后同样 hideOverlayAndCamera 收起；BSD 主浮窗
+     *    实际走 AVM 绑定路径（getAvmBinding 恒返回 8），按 avmModeActive 判断是否补发 mode=8；
+     *    物理预览路径（avmModeActive==false）不涉 AVM mode，无需发送。
+     * 3) BSD 右独立窗：调 hideBsdRightOverlay 单独收起（复用 overlay_window 布局，不涉 AVM mode）。
+     * 手动浮窗（MANUAL）为用户主动调试，不在自动收起范围。
+     */
+    private void collectNarrowAssistOverlays() {
+        serviceLog("窄路辅助窗口出现，主动收起已显示浮窗");
+        boolean anyTurn = lastActiveDir != null && !"MANUAL".equals(lastActiveDir);
+        boolean anyBsdMain = bsdAutoActiveDir != null;
+        if (anyTurn) {
+            narrowTurnDirSnapshot = lastActiveDir;
+            narrowTurnStillOn = true;
+        } else {
+            narrowTurnDirSnapshot = null;
+            narrowTurnStillOn = false;
+        }
+        boolean wasAvm = avmModeActive;
+        if (anyTurn || anyBsdMain) {
+            if (anyBsdMain) {
+                bsdAutoActiveDir = null;
+            }
+            hideOverlayAndCamera();
+            if (wasAvm) {
+                sendAvmMode(8);
+                serviceLog("窄路辅助收起：浮窗曾绑定 AVM 视角，恢复 display-mode=8（360 全景默认）");
+            } else {
+                serviceLog("窄路辅助收起：浮窗为物理预览路径，无需下发 AVM mode");
+            }
+        }
+        if (bsdRightOverlayShowing) {
+            hideBsdRightOverlay();
+            serviceLog("窄路辅助收起：BSD 右独立窗已收起");
+        }
+    }
+
+    /**
+     * v1.56 beta3：窄路辅助窗口消失边沿——解除抑制后按当前状态恢复浮窗。
+     * 1) 打灯信号仍亮（窄路期间未收到熄灭回调）且记录过方向 → 恢复打灯浮窗：
+     *    showOverlayForDirection(dir) 内 AVM 绑定块自动 sendAvmMode(8)（绑定视角即 360 全景默认），
+     *    红框由 syncTurnBsdRedOverlay 同步；若打灯已熄灭则窄路期间抑制的新亮起方向已由
+     *    onSignalChanged 快照接续，同样可恢复。
+     * 2) BSD 对应侧信号仍为 1（有车）→ 按当前电平直接恢复弹窗（复用 onBsdEdge 上升沿，
+     *    含双开/左右逻辑与红色遮罩；窄路期间上升沿被 shouldSuppressBsdAuto 抑制后无新沿，
+     *    必须按电平补沿）。打灯已恢复时 onBsdEdge 内部打灯占用抑制自然让位。
+     * 恢复完成后进入 2s 防抖窗口（调用方设置 narrowExitSuppressUntilMs），窗口内窄路再现不重复收起。
+     */
+    private void restoreAfterNarrowExit(SignalGate.Snapshot s) {
+        serviceLog("窄路辅助窗口消失，按当前状态恢复浮窗");
+        // 1) 打灯仍亮：恢复打灯浮窗（AVM 绑定路径自动下发 display-mode=8）
+        if (narrowTurnStillOn && narrowTurnDirSnapshot != null) {
+            String dir = narrowTurnDirSnapshot;
+            serviceLog("窄路恢复：打灯信号仍亮（" + dir + "），恢复打灯浮窗 + display-mode=8");
+            showOverlayForDirection(dir);
+        }
+        // 2) BSD 侧仍 1：按当前电平恢复弹窗（左亮恢复左主浮窗；右亮按双开/左右逻辑恢复）
+        if (s.bsdLeft) {
+            serviceLog("窄路恢复：BSD 左侧信号仍为 1，按当前电平恢复弹窗");
+            onBsdEdge("LEFT", true);
+        }
+        if (s.bsdRight) {
+            serviceLog("窄路恢复：BSD 右侧信号仍为 1，按当前电平恢复弹窗");
+            onBsdEdge("RIGHT", true);
+        }
+        // 消耗本 tick 刚出现的 BSD 上升沿（若有），避免紧随其后的 BSD 边沿检测块重复弹窗；
+        // 正常无新沿时赋值与已有状态一致，无副作用。
+        lastBsdLeft = s.bsdLeft;
+        lastBsdRight = s.bsdRight;
+        // 清理恢复快照
+        narrowTurnDirSnapshot = null;
+        narrowTurnStillOn = false;
+    }
+
+    /** v1.54：BSD 双开时右侧独立只读浮窗——位置固定为紧挨左浮窗预设位置的右侧
+     * （rightX = leftX + 左浮窗宽 + 8dp），无论左浮窗是否实际出现均按该公式摆放；
+     * 不参与拖动/编辑（复用 overlay_window 布局，隐藏关闭按钮）。 */
+    private void showBsdRightOverlay() {
+        if (bsdRightOverlayShowing || bsdRightOverlayView != null) return;
+        try {
+            LayoutInflater li = (LayoutInflater) getSystemService(LAYOUT_INFLATER_SERVICE);
+            bsdRightOverlayView = li.inflate(R.layout.overlay_window, null);
+            bsdRightTextureView = bsdRightOverlayView.findViewById(R.id.overlay_texture);
+            if (bsdRightTextureView != null) {
+                bsdRightTextureView.setClipToOutline(true);
+                bsdRightTextureView.setOutlineProvider(new ViewOutlineProvider() {
+                    @Override
+                    public void getOutline(View view, Outline outline) {
+                        outline.setRoundRect(0, 0, view.getWidth(), view.getHeight(), dp(24));
+                    }
+                });
+                bsdRightTextureView.setSurfaceTextureListener(bsdRightSurfaceListener);
+            }
+            bsdRightLabelView = bsdRightOverlayView.findViewById(R.id.overlay_label);
+            if (bsdRightLabelView != null) bsdRightLabelView.setText("BSD 右侧预警");
+            View closeBtn = bsdRightOverlayView.findViewById(R.id.overlay_close);
+            if (closeBtn != null) closeBtn.setVisibility(View.GONE);
+            DisplayMetrics dm = new DisplayMetrics();
+            wm.getDefaultDisplay().getRealMetrics(dm);
+            SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+            migrateLegacyOverlayScale(dm.widthPixels, dm.heightPixels);
+            // v1.54 beta4：右窗宽高优先用 bsd_right_ 独立键（编辑保存过才生效），
+            // 否则回退 beta3 的 left_ 键/避让公式逻辑
+            boolean bsdRightEdited = prefs.contains("bsd_right_overlay_w")
+                    || prefs.contains("bsd_right_cam_scale");
+            int w;
+            int h;
+            int x;
+            int y;
+            if (bsdRightEdited) {
+                int minW = (int) (dm.widthPixels * MIN_SIZE_RATIO);
+                int minH = (int) (dm.heightPixels * MIN_SIZE_RATIO);
+                w = prefs.getInt("bsd_right_overlay_w", readOverlayW(dm.widthPixels));
+                h = prefs.getInt("bsd_right_overlay_h", readOverlayH(dm.heightPixels));
+                if (w < minW) w = minW;
+                if (w > dm.widthPixels) w = dm.widthPixels;
+                if (h < minH) h = minH;
+                if (h > dm.heightPixels) h = dm.heightPixels;
+                if (prefs.getBoolean("bsd_right_overlay_pos_recorded", false)) {
+                    x = prefs.getInt("bsd_right_overlay_pos_x",
+                            dm.widthPixels - w - 120);
+                    y = prefs.getInt("bsd_right_overlay_pos_y",
+                            dm.heightPixels - h - 120);
+                } else {
+                    int leftX = prefs.getInt("left_overlay_pos_x", 120);
+                    int leftY = prefs.getInt("left_overlay_pos_y", dm.heightPixels - h - 120);
+                    x = leftX + w + dp(BSD_DUAL_GAP_DP);
+                    y = leftY;
+                }
+            } else {
+                // 右窗宽高/位置完全按左窗配置计算：w/h 用 left_ 键，位置取左窗持久化 x/y 右侧偏移
+                w = readOverlayW(dm.widthPixels);
+                h = readOverlayH(dm.heightPixels);
+                int leftX = prefs.getInt("left_overlay_pos_x", 120);
+                int leftY = prefs.getInt("left_overlay_pos_y", dm.heightPixels - h - 120);
+                x = leftX + w + dp(BSD_DUAL_GAP_DP);
+                y = leftY;
+            }
+            WindowManager.LayoutParams lp = new WindowManager.LayoutParams(
+                    w, h,
+                    WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                    WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                            | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
+                            | WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
+                    PixelFormat.TRANSLUCENT);
+            lp.gravity = Gravity.TOP | Gravity.START;
+            lp.x = x;
+            lp.y = y;
+            wm.addView(bsdRightOverlayView, lp);
+            bsdRightOverlayShowing = true;
+            // v1.54 beta3：BSD 预警右窗加红色遮罩 + 复用右转向灯画面源渲染（与位置解耦）
+            showRedOverlayOn(bsdRightOverlayView);
+            applyBsdRightRenderTransform();
+            serviceLog("BSD 自动弹窗：BSD 双开，右浮窗已弹（x=" + x + ", y=" + y + ", w=" + w + "）");
+            // 主浮窗会话已就绪时重建预览会话以包含右窗 surface（同一路预览双窗输出）
+            if (cameraDevice != null && textureView != null && textureView.isAvailable()) {
+                createPreviewSession();
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "BSD 右窗 addView failed", e);
+            hideBsdRightOverlay();
+        }
+    }
+
+    /** 移除 BSD 右浮窗并释放其 surface；主会话存活时重建预览会话去掉右窗 target。 */
+    private void hideBsdRightOverlay() {
+        if (bsdRightOverlayView != null) {
+            // v1.54 beta3：关闭前移除红色遮罩
+            hideRedOverlayOn(bsdRightOverlayView);
+            try {
+                wm.removeView(bsdRightOverlayView);
+            } catch (Exception ignored) {
+            }
+            bsdRightOverlayView = null;
+        }
+        bsdRightOverlayShowing = false;
+        bsdRightTextureView = null;
+        bsdRightLabelView = null;
+        if (bsdRightSurface != null) {
+            bsdRightSurface.release();
+            bsdRightSurface = null;
+        }
+        if (cameraDevice != null && textureView != null && textureView.isAvailable()) {
+            createPreviewSession();
+        }
+    }
+
+    /** BSD 右浮窗 TextureView 监听：surface 就绪后把右窗 target 加入预览会话。 */
+    private final TextureView.SurfaceTextureListener bsdRightSurfaceListener = new TextureView.SurfaceTextureListener() {
+        @Override
+        public void onSurfaceTextureAvailable(SurfaceTexture st, int width, int height) {
+            st.setDefaultBufferSize(BUFFER_W, BUFFER_H);
+            // v1.54 beta3：右窗 surface 就绪后重放渲染矩阵（复用右转向灯画面源，与位置解耦）
+            applyBsdRightRenderTransform();
+            if (cameraDevice != null && textureView != null && textureView.isAvailable()) {
+                createPreviewSession();
+            }
+        }
+
+        @Override
+        public void onSurfaceTextureSizeChanged(SurfaceTexture st, int width, int height) {
+            st.setDefaultBufferSize(BUFFER_W, BUFFER_H);
+            // v1.54 beta3：右窗尺寸变化重放渲染矩阵
+            applyBsdRightRenderTransform();
+        }
+
+        @Override
+        public boolean onSurfaceTextureDestroyed(SurfaceTexture st) {
+            return true;
+        }
+
+        @Override
+        public void onSurfaceTextureUpdated(SurfaceTexture st) {
+        }
+    };
+
+    // ---- v1.54 beta3：BSD 预警红色遮罩 + 右预警画面复用右转向灯画面源 ----
+
+    /** 在宿主浮窗边界加一小圈向内的半透明红色遮罩（示意 BSD 预警状态）。
+     * 仅 BSD 预警弹窗调用（onBsdEdge/showBsdRightOverlay）；开关关闭时不加。
+     * 宿主必须为 overlay_window 的 FrameLayout；遮罩 View 不可点击，不拦截拖动/编辑手势。
+     * v1.54 beta4：红边改为呼吸红色渐变闪烁——alpha 在低-高区间周期性循环，替换静态描边。 */
+    private void showRedOverlayOn(View host) {
+        if (host == null || !bsdRedOverlay) return;
+        if (host.findViewWithTag("bsd_red_overlay") != null) return;
+        android.graphics.drawable.GradientDrawable gd = new android.graphics.drawable.GradientDrawable();
+        gd.setColor(0x00000000);
+        gd.setStroke(dp(9), 0x66FF0000); // v1.54 beta7：呼吸红框描边加粗为 3 倍（3dp→9dp）
+        View rv = new View(this);
+        rv.setTag("bsd_red_overlay");
+        rv.setBackground(gd);
+        rv.setClickable(false);
+        rv.setFocusable(false);
+        FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT);
+        ((FrameLayout) host).addView(rv, lp);
+        // v1.54 beta4：呼吸闪烁动画——透明度 0.15 -> 1.0 循环往复，红边随之渐变闪动
+        android.animation.ObjectAnimator anim = android.animation.ObjectAnimator.ofFloat(rv, "alpha", 0.15f, 1.0f);
+        anim.setDuration(900);
+        anim.setRepeatMode(android.animation.ValueAnimator.REVERSE);
+        anim.setRepeatCount(android.animation.ValueAnimator.INFINITE);
+        anim.start();
+        rv.setTag(R.id.overlay_border, anim);
+    }
+
+    /** 移除宿主浮窗上的 BSD 预警红色遮罩（无则跳过），并取消呼吸动画。 */
+    private void hideRedOverlayOn(View host) {
+        if (host == null) return;
+        View rv = host.findViewWithTag("bsd_red_overlay");
+        if (rv != null) {
+            Object anim = rv.getTag(R.id.overlay_border);
+            if (anim instanceof android.animation.Animator) {
+                ((android.animation.Animator) anim).cancel();
+            }
+            ((FrameLayout) host).removeView(rv);
+        }
+    }
+
+    /** v1.54 beta7：打灯浮窗联动 BSD 红框——BSD 信号边沿到来时，若对应侧打灯变道浮窗
+     * 正在显示（非 BSD 弹起、非手动），叠加/移除呼吸红框。复用 showRedOverlayOn（内部受
+     * bsd_red_overlay 开关控制）；打灯期间 BSD 自动弹窗已被最低优先级抑制，红框为替代提醒。 */
+    private void onBsdEdgeForTurn(String dir, boolean rising) {
+        if (overlayView == null || direction == null) return;
+        if ("MANUAL".equals(direction)) return;
+        if (bsdAutoActiveDir != null) return;
+        if (!dir.equals(direction)) return;
+        if (rising) {
+            showRedOverlayOn(overlayView);
+            serviceLog("BSD 联动红框: 打" + ("LEFT".equals(dir) ? "左" : "右")
+                    + "转向灯期间对应侧 BSD 有车，浮窗叠加呼吸红框");
+        } else {
+            hideRedOverlayOn(overlayView);
+            serviceLog("BSD 联动红框: " + ("LEFT".equals(dir) ? "左" : "右")
+                    + "侧 BSD 信号消失，移除打灯浮窗红框");
+        }
+    }
+
+    /** v1.54 beta7：打灯浮窗建立/方向切换后同步当前 BSD 状态——对应侧 BSD 已有车（无 0->1 边沿）
+     * 时立即叠加呼吸红框，保证浮窗显示期间红框状态与 BSD 信号实时一致。 */
+    private void syncTurnBsdRedOverlay() {
+        if (overlayView == null || direction == null || "MANUAL".equals(direction)) return;
+        if (bsdAutoActiveDir != null) return;
+        if (!bsdRedOverlay) return;
+        if (signalGate == null) return;
+        SignalGate.Snapshot s = signalGate.snapshot();
+        boolean warn = "LEFT".equals(direction) ? s.bsdLeft : s.bsdRight;
+        if (warn) {
+            if (overlayView.findViewWithTag("bsd_red_overlay") == null) {
+                showRedOverlayOn(overlayView);
+                serviceLog("BSD 联动红框: 打" + ("LEFT".equals(direction) ? "左" : "右")
+                        + "转向灯浮窗显示期间对应侧 BSD 已有车，叠加呼吸红框");
+            }
+        } else {
+            hideRedOverlayOn(overlayView);
+        }
+    }
+
+    /** v1.54 beta3：BSD 右预警浮窗渲染矩阵——默认复用右转向灯画面源设置（right_cam_scale /
+     * right_pan_x / right_pan_y，与打右转向灯浮窗同一套持久化键，包含默认初始右下 1/4 裁切
+     * 与用户编辑后的自由平移），使右预警画面与打右转向灯时完全一致。
+     * v1.54 beta4：若用户已用「编辑预警浮窗」保存过 bsd_right_ 独立键（存在 bsd_right_cam_scale），
+     * 则优先使用 bsd_right_ 独立配置，未编辑时保持 beta3 的 right_ 键回退逻辑。
+     * 画面内容与浮窗位置彻底解耦：矩阵只依赖窗口尺寸与画面配置，不读 lp.x/lp.y。 */
+    private void applyBsdRightRenderTransform() {
+        if (bsdRightOverlayView == null || bsdRightTextureView == null) return;
+        WindowManager.LayoutParams lp = (WindowManager.LayoutParams) bsdRightOverlayView.getLayoutParams();
+        int vw = lp.width;
+        int vh = lp.height;
+        if (vw <= 0) vw = 1;
+        if (vh <= 0) vh = 1;
+        DisplayMetrics dm = new DisplayMetrics();
+        wm.getDefaultDisplay().getRealMetrics(dm);
+        float defW = dm.widthPixels * OVERLAY_DEF_W_RATIO;
+        float defH = defW * 9f / 16f;
+        SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+        // v1.54 beta4：bsd_right_ 独立键优先，未编辑回退 right_ 键（beta3 行为不变）
+        boolean bsdEdited = prefs.contains("bsd_right_cam_scale");
+        float cs = prefs.getFloat(bsdEdited ? "bsd_right_cam_scale" : "right_cam_scale",
+                CAM_SCALE_DEFAULT);
+        if (cs < CAM_SCALE_MIN) cs = CAM_SCALE_MIN;
+        if (cs > CAM_SCALE_MAX) cs = CAM_SCALE_MAX;
+        float Wv = defW * cs;
+        float Hv = defH * cs;
+        float scale = Wv / BUFFER_W;
+        float dx;
+        float dy;
+        // 与 applyRenderTransform 的 defaultCrop 判定一致：右预警未编辑过（无 bsd_right_cam_scale
+        // 键、也无 right_cam_scale 键）时按默认初始裁切显示（四宫格右下 1/4）；已编辑则完全复用
+        // 用户调整后的画面配置（bsd_ 键或 right_ 键）
+        boolean defaultCrop = !prefs.contains("bsd_right_cam_scale")
+                && !prefs.contains("right_cam_scale");
+        if (defaultCrop) {
+            float fit = Math.min(vw / Wv, vh / Hv);
+            scale = (Wv / BUFFER_W) * fit;
+            dx = (vw - Wv * fit) / 2f;
+            dy = (vh - Hv * fit) / 2f;
+        } else {
+            float panX = prefs.getFloat(bsdEdited ? "bsd_right_pan_x" : "right_pan_x", 0f);
+            float panY = prefs.getFloat(bsdEdited ? "bsd_right_pan_y" : "right_pan_y", 0f);
+            dx = (vw - Wv) / 2f + panX;
+            dy = (vh - Hv) / 2f + panY;
+        }
+        android.graphics.Matrix m = new android.graphics.Matrix();
+        m.reset();
+        m.postScale(scale, scale);
+        m.postTranslate(dx, dy);
+        bsdRightTextureView.setTransform(m);
+        serviceLog("BSD右窗RT vw=" + vw + " vh=" + vh + " Wv=" + (int) Wv + " Hv=" + (int) Hv
+                + " scale=" + String.format("%.4f", scale) + " dx=" + (int) dx + " dy=" + (int) dy
+                + " src=" + (bsdEdited ? "bsd_right_" : "right_"));
+    }
+
+    /** v1.54：BSD 常显窄条位置一键复位（ACTION_RESET_BSD_POS 入口）。 */
+    private void resetBsdPositionsInternal() {
+        if (sideWarning != null) {
+            sideWarning.resetPositions();
+        }
+        serviceLog("BSD 常显窄条位置已一键复位为默认（x=8dp, y=90dp）");
+    }
+
     /** 按方向显示/切换浮窗：首次弹窗创建 overlay，方向变化释放旧摄像头并按新方向重开。 */
     private void showOverlayForDirection(String dir) {
+        // v1.54：BSD 自动弹窗调用（bsdAutoCalling=true）已由 onBsdEdge 完成最低优先级抑制判定，
+        // 这里跳过打灯专属抑制块；同时不参与打灯幂等锁/方向锁写入，避免污染打灯链路。
+        boolean bsdCall = bsdAutoCalling;
+        // v1.52/v1.53 beta2：抑制优先级（仅作用于转向灯弹窗，不干扰 MANUAL 手动调试）：
+        // 窄路辅助动态窗口（最高） > GEARLEV==3 倒车显示中 > R 挡退出短延时窗口 > 原厂相机焦点 > 单边转向。
+        if (!bsdCall && !"MANUAL".equals(dir)) {
+            // v1.53 beta2：窄路辅助动态窗口在屏（裸包名窗口）时打灯一律抑制，
+            // 避免转向浮窗覆盖窄路辅助画面（最高优先级）。
+            if (signalGate != null && signalGate.snapshot().narrowAssistActive) {
+                serviceLog("窄路辅助动态窗口在屏，打灯抑制不弹浮窗");
+                return;
+            }
+            // v1.53：R 挡进行中（gearLevel==3 已正确解析）打灯一律抑制，
+            // 避免倒车影像期间弹转向浮窗抢占 AVM 画面。
+            if (signalGate != null && signalGate.snapshot().gearLevel == 3) {
+                serviceLog("R 挡进行中（gearLevel=3），打灯抑制不弹浮窗");
+                return;
+            }
+            long remain = rExitSuppressUntilMs - System.currentTimeMillis();
+            if (remain > 0) {
+                serviceLog("R 挡退出延时抑制窗口内（剩余 " + remain + "ms），打灯不弹浮窗");
+                return;
+            }
+        }
+        // v1.57 beta3：浮窗弹窗即异步启动仪表 H.264 投影（连接失败静默降级，浮窗不受影响）。
+        // 多次打灯循环：stop 后再次 show 可重新启动，不泄漏编码器/socket/线程。
+        startProjectionIfEnabled();
         // v1.39：同方向持续亮起期间若浮窗与相机均已就绪，忽略重复触发，绝不重发 AVM 绑定视角。
         // 打灯后转向灯信号理论上只产生一次 0->1 边沿；若车机 dumpsys 输出抖动出现假边沿，
         // 再次进入本方法会重复 sendAvmMode 抢占 AVM 视角（表现为倒挡影像被覆盖、转向画面卡顿），
         // 此幂等锁 + SignalMonitor 缺失行保持原状态双重兜底，确保打灯期间只下发一次绑定视角。
-        if (dir.equals(lastActiveDir) && overlayView != null && cameraDevice != null) {
+        // v1.54：BSD 自动弹窗调用不参与幂等锁（0->1 边沿每轮至多一次，无重复触发风险）。
+        if (!bsdCall && dir.equals(lastActiveDir) && overlayView != null && cameraDevice != null) {
             serviceLog("同方向信号持续亮起，忽略重复触发，不重发 AVM 视角");
             return;
         }
-        lastActiveDir = dir;
+        // v1.57：打灯/手动接管浮窗时无条件清理 BSD 归属标记并移除预警红框——
+        // 预警红框与预警浮窗完全绑定（随浮窗出现/消失），浮窗一旦被转向/手动接管
+        // （不再限于同方向），立即移除预警红框；清理归属保证转向红框独立判定
+        // （syncTurnBsdRedOverlay / onBsdEdgeForTurn 不再被残留归属短路），
+        // 同时避免 BSD 预警熄灭沿把已接管浮窗误关（见 onBsdEdge）。
+        if (!bsdCall) {
+            if (bsdAutoActiveDir != null) {
+                serviceLog("打灯/手动接管浮窗，清理 BSD 归属标记（" + bsdAutoActiveDir + "）");
+                bsdAutoActiveDir = null;
+            }
+            hideRedOverlayOn(overlayView);
+        }
+        if (!bsdCall) {
+            lastActiveDir = dir;
+        }
         String oldDir = direction;
         // v1.48：方向切换前先保存旧方向当前显示状态（位置/大小/画面缩放平移），
         // 修复编辑模式未退出或普通调整后直接换方向打灯导致旧方向配置丢失的问题。
@@ -566,6 +1459,8 @@ public class CameraOverlayService extends Service implements SignalMonitor.Liste
                 // v1.33：AVM 绑定路径同样打开物理摄像头（openCamera 默认 cameraId=0，实车可出鱼眼画面），
                 // 否则浮窗 TextureView 无预览流导致打灯画面空白。
                 openCamera();
+                // v1.54 beta7：打灯浮窗建立后同步当前 BSD 状态——对应侧 BSD 已有车则立即叠加呼吸红框
+                syncTurnBsdRedOverlay();
                 return;
             }
         }
@@ -602,6 +1497,34 @@ public class CameraOverlayService extends Service implements SignalMonitor.Liste
         avmModeActive = false;
         removeOverlay();
         releaseCamera();
+        // v1.57 beta3：熄灯/预警结束收窗，同步干净停止投影（stop 幂等）
+        stopProjection();
+    }
+
+    // ---- v1.57 beta3：仪表 H.264 投影联动 ----
+
+    /** 启用仪表投影时异步启动（失败静默降级，绝不阻塞/影响浮窗）。 */
+    private void startProjectionIfEnabled() {
+        if (!iclProjectionEnabled) {
+            return;
+        }
+        try {
+            if (icProjector.isRunning()) {
+                return;
+            }
+            icProjector.start(iclIp, iclPort);
+        } catch (Throwable t) {
+            Log.w(TAG, "startProjection failed, silent: " + t.getMessage());
+        }
+    }
+
+    /** 同步停止仪表投影（幂等，可重复调用）。 */
+    private void stopProjection() {
+        try {
+            icProjector.stop();
+        } catch (Throwable t) {
+            Log.w(TAG, "stopProjection failed, silent: " + t.getMessage());
+        }
     }
 
     /**
@@ -1670,6 +2593,8 @@ public class CameraOverlayService extends Service implements SignalMonitor.Liste
                 saveEditConfigInternal();
                 editMode = false;
             }
+            // v1.54 beta3：关闭前移除 BSD 预警红色遮罩（若存在）
+            hideRedOverlayOn(overlayView);
             try {
                 wm.removeView(overlayView);
             } catch (Exception ignored) {
@@ -1728,6 +2653,8 @@ public class CameraOverlayService extends Service implements SignalMonitor.Liste
             cameraManager.openCamera(cameraId, deviceCallback, bgHandler);
         } catch (CameraAccessException | SecurityException e) {
             Log.e(TAG, "openCamera failed", e);
+            // v1.52：Camera2 打开失败时尝试 Camera1 回退钩子（默认关闭，偏好 camera1_fallback 开启）
+            tryCamera1Fallback();
         }
     }
 
@@ -1738,6 +2665,17 @@ public class CameraOverlayService extends Service implements SignalMonitor.Liste
      * 避免右转向落到 ids[1]（video52）导致画面缺一块（实车确认左转向 video51 画面完整）。 */
     private String pickCameraId(String[] ids) {
         SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+        // v1.54 beta6：BSD 编辑态优先读 bsd_ 前缀 cameraId（左 bsd_left_camera_id、
+        // 右 bsd_right_camera_id），回退打灯键，保证编辑窗画面与预警浮窗同源
+        if (bsdEditActive) {
+            String bsdKey = "LEFT".equals(direction) ? "bsd_left_camera_id" : "bsd_right_camera_id";
+            String bsdSaved = prefs.getString(bsdKey, null);
+            if (bsdSaved != null) {
+                for (String id : ids) {
+                    if (id.equals(bsdSaved)) return id;
+                }
+            }
+        }
         String key = "LEFT".equals(direction) ? "left_camera_id" : "right_camera_id";
         String saved = prefs.getString(key, null);
         if (saved != null) {
@@ -1900,6 +2838,11 @@ public class CameraOverlayService extends Service implements SignalMonitor.Liste
 
     /** 仅关闭摄像头通道（保留 TextureView/SurfaceTexture），用于方向切换后按新方向重开。 */
     private void closeCameraOnly() {
+        // v1.52：Camera1 回退实例一并释放（幂等）
+        if (camera1Preview != null) {
+            camera1Preview.close();
+            camera1Preview = null;
+        }
         if (captureSession != null) {
             captureSession.close();
             captureSession = null;
@@ -1912,13 +2855,26 @@ public class CameraOverlayService extends Service implements SignalMonitor.Liste
             previewSurface.release();
             previewSurface = null;
         }
+        // v1.54：BSD 右浮窗 surface 一并释放
+        if (bsdRightSurface != null) {
+            bsdRightSurface.release();
+            bsdRightSurface = null;
+        }
+        // v1.54 beta4：BSD 编辑窗 surface 一并释放
+        if (bsdEditLeft != null) {
+            bsdEditLeft.releaseSurface();
+        }
+        if (bsdEditRight != null) {
+            bsdEditRight.releaseSurface();
+        }
     }
 
     private final CameraDevice.StateCallback deviceCallback = new CameraDevice.StateCallback() {
         @Override
         public void onOpened(CameraDevice device) {
             cameraDevice = device;
-            if (textureView != null && textureView.isAvailable()) {
+            // v1.54 beta4：无主窗 textureView（BSD 编辑窗独立预览）时也建立会话
+            if (hasAnyPreviewTarget()) {
                 createPreviewSession();
             }
         }
@@ -1936,24 +2892,71 @@ public class CameraOverlayService extends Service implements SignalMonitor.Liste
         }
     };
 
+    /** v1.54 beta4：是否存在任一可用预览目标（主窗 / BSD 右窗 / BSD 编辑窗）。 */
+    private boolean hasAnyPreviewTarget() {
+        if (textureView != null && textureView.isAvailable()) return true;
+        if (bsdRightTextureView != null && bsdRightTextureView.isAvailable()) return true;
+        if (bsdEditLeft != null && bsdEditLeft.isTargetReady()) return true;
+        if (bsdEditRight != null && bsdEditRight.isTargetReady()) return true;
+        return false;
+    }
+
     private void createPreviewSession() {
-        if (cameraDevice == null || textureView == null) return;
+        if (cameraDevice == null) return;
         try {
-            SurfaceTexture st = textureView.getSurfaceTexture();
-            if (st == null) return;
-            st.setDefaultBufferSize(BUFFER_W, BUFFER_H);
-            bufferW = BUFFER_W;
-            bufferH = BUFFER_H;
-            if (previewSurface != null) {
-                previewSurface.release();
-                previewSurface = null;
+            java.util.ArrayList<Surface> targets = new java.util.ArrayList<>();
+            if (textureView != null && textureView.isAvailable()
+                    && textureView.getSurfaceTexture() != null) {
+                SurfaceTexture st = textureView.getSurfaceTexture();
+                st.setDefaultBufferSize(BUFFER_W, BUFFER_H);
+                bufferW = BUFFER_W;
+                bufferH = BUFFER_H;
+                if (previewSurface != null) {
+                    previewSurface.release();
+                    previewSurface = null;
+                }
+                previewSurface = new Surface(st);
+                targets.add(previewSurface);
             }
-            previewSurface = new Surface(st);
+            // v1.54：BSD 双窗——右浮窗纹理就绪时一并加入同一路预览输出
+            if (bsdRightTextureView != null && bsdRightTextureView.isAvailable()
+                    && bsdRightTextureView.getSurfaceTexture() != null) {
+                if (bsdRightSurface != null) {
+                    bsdRightSurface.release();
+                    bsdRightSurface = null;
+                }
+                bsdRightTextureView.getSurfaceTexture().setDefaultBufferSize(BUFFER_W, BUFFER_H);
+                bsdRightSurface = new Surface(bsdRightTextureView.getSurfaceTexture());
+                targets.add(bsdRightSurface);
+            }
+            // v1.54 beta4：BSD 编辑双窗（左/右）纹理就绪时一并加入预览输出
+            if (bsdEditLeft != null) {
+                bsdEditLeft.addSurfaceTarget(targets);
+            }
+            if (bsdEditRight != null) {
+                bsdEditRight.addSurfaceTarget(targets);
+            }
+            // v1.57 beta3：仪表 H.264 投影——启用且编码器已创建时追加编码器 input Surface
+            // 到同一路预览会话（MediaCodec Surface 输入直接消费 Camera2 预览帧）。
+            // 编码器未就绪则正常建会话，不影响浮窗。
+            if (iclProjectionEnabled) {
+                Surface iclSurface = icProjector.getInputSurface();
+                if (iclSurface != null && iclSurface.isValid()) {
+                    targets.add(iclSurface);
+                }
+            }
+            if (targets.isEmpty()) {
+                // 无任何可用预览目标（例如编辑窗刚关闭、主窗纹理未就绪），保持摄像头关闭状态
+                releaseCamera();
+                return;
+            }
             final CaptureRequest.Builder builder =
                     cameraDevice.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW);
-            builder.addTarget(previewSurface);
+            for (Surface target : targets) {
+                builder.addTarget(target);
+            }
             builder.set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO);
-            cameraDevice.createCaptureSession(Collections.singletonList(previewSurface),
+            cameraDevice.createCaptureSession(targets,
                     new CameraCaptureSession.StateCallback() {
                         @Override
                         public void onConfigured(CameraCaptureSession session) {
@@ -1981,6 +2984,11 @@ public class CameraOverlayService extends Service implements SignalMonitor.Liste
      * 幂等，可被 onDestroy 与 onSurfaceTextureDestroyed 重复调用。
      */
     private void releaseCamera() {
+        // v1.52：Camera1 回退实例一并释放（幂等）
+        if (camera1Preview != null) {
+            camera1Preview.close();
+            camera1Preview = null;
+        }
         if (captureSession != null) {
             captureSession.close();
             captureSession = null;
@@ -1992,6 +3000,18 @@ public class CameraOverlayService extends Service implements SignalMonitor.Liste
         if (previewSurface != null) {
             previewSurface.release();
             previewSurface = null;
+        }
+        // v1.54：BSD 右浮窗 surface 一并释放
+        if (bsdRightSurface != null) {
+            bsdRightSurface.release();
+            bsdRightSurface = null;
+        }
+        // v1.54 beta4：BSD 编辑窗 surface 一并释放
+        if (bsdEditLeft != null) {
+            bsdEditLeft.releaseSurface();
+        }
+        if (bsdEditRight != null) {
+            bsdEditRight.releaseSurface();
         }
         if (textureView != null) {
             textureView.setSurfaceTextureListener(null);
@@ -2009,13 +3029,863 @@ public class CameraOverlayService extends Service implements SignalMonitor.Liste
             monitor.stop();
             monitor = null;
         }
+        // v1.52：销毁兜底停止 SignalGate 慢变量轮询并摘除 BSD 窄条
+        if (signalGate != null) {
+            signalGate.stop();
+        }
+        if (sideWarning != null) {
+            sideWarning.detach();
+        }
         linkActive.set(false);
         manualVisible.set(false);
+        // v1.54 beta4：服务销毁时隐藏 BSD 编辑窗（不保存，与主窗一并移除）
+        if (bsdEditLeft != null) {
+            bsdEditLeft.removeFromWindow();
+            bsdEditLeft = null;
+        }
+        if (bsdEditRight != null) {
+            bsdEditRight.removeFromWindow();
+            bsdEditRight = null;
+        }
         releaseCamera();
         removeOverlay();
         if (bgThread != null) bgThread.quitSafely();
         serviceLog("前台服务已停止");
         super.onDestroy();
+    }
+
+    // ---- v1.54 beta4：BSD 预警浮窗自定义编辑窗 ----
+
+    /**
+     * v1.54 beta4：BSD 预警浮窗独立编辑窗（左右各一）。
+     * 复用 overlay_window 布局：单指拖动位置（松手保存 bsd_left/right_ 键）、
+     * 双击进入编辑（单指平移画面 / 双指缩放 / 拖边改形状，保存 bsd_ 前缀独立键）、
+     * 右上角关闭按钮单独关闭该侧并保存对应配置。
+     * 画面渲染与位置解耦：默认未编辑时 fitCenter 完整显示，编辑后按 bsd_ 键自由渲染。
+     */
+    private class BsdEditWindow {
+        final String side;          // "LEFT" / "RIGHT"
+        final String bsdPrefix;     // "bsd_left_" / "bsd_right_"
+        final String turnPrefix;    // "left_" / "right_"（打灯对应键，同步与回退来源）
+        final View rootView;
+        final TextureView textureView;
+        final View closeView;
+        final View borderView;
+        final android.widget.TextView editHintView;
+        final View cropHandleL, cropHandleR, cropHandleT, cropHandleB;
+        final View cropHandleTL, cropHandleTR, cropHandleBL, cropHandleBR;
+        boolean editMode = false;
+        float camScale = CAM_SCALE_DEFAULT;
+        float panX = 0f;
+        float panY = 0f;
+        Surface editSurface = null;
+        final WindowManager.LayoutParams lp;
+
+        BsdEditWindow(String side) {
+            this.side = side;
+            this.bsdPrefix = "LEFT".equals(side) ? "bsd_left_" : "bsd_right_";
+            this.turnPrefix = "LEFT".equals(side) ? "left_" : "right_";
+            LayoutInflater li = (LayoutInflater) getSystemService(LAYOUT_INFLATER_SERVICE);
+            rootView = li.inflate(R.layout.overlay_window, null);
+            textureView = rootView.findViewById(R.id.overlay_texture);
+            if (textureView != null) {
+                textureView.setClipToOutline(true);
+                textureView.setOutlineProvider(new ViewOutlineProvider() {
+                    @Override
+                    public void getOutline(View view, Outline outline) {
+                        outline.setRoundRect(0, 0, view.getWidth(), view.getHeight(), dp(24));
+                    }
+                });
+                textureView.setSurfaceTextureListener(bsdEditSurfaceListener);
+            }
+            TextView label = rootView.findViewById(R.id.overlay_label);
+            if (label != null) {
+                label.setText("LEFT".equals(side) ? "BSD 左预警编辑" : "BSD 右预警编辑");
+            }
+            closeView = rootView.findViewById(R.id.overlay_close);
+            if (closeView != null) {
+                closeView.setOnClickListener(new View.OnClickListener() {
+                    @Override
+                    public void onClick(View v) {
+                        closeBsdWindow(CameraOverlayService.this, BsdEditWindow.this.side);
+                    }
+                });
+            }
+            borderView = rootView.findViewById(R.id.overlay_border);
+            cropHandleL = rootView.findViewById(R.id.handle_left);
+            cropHandleR = rootView.findViewById(R.id.handle_right);
+            cropHandleT = rootView.findViewById(R.id.handle_top);
+            cropHandleB = rootView.findViewById(R.id.handle_bottom);
+            cropHandleTL = rootView.findViewById(R.id.handle_tl);
+            cropHandleTR = rootView.findViewById(R.id.handle_tr);
+            cropHandleBL = rootView.findViewById(R.id.handle_bl);
+            cropHandleBR = rootView.findViewById(R.id.handle_br);
+            editHintView = rootView.findViewById(R.id.overlay_edit_hint);
+            android.graphics.drawable.GradientDrawable borderBg = new android.graphics.drawable.GradientDrawable();
+            borderBg.setStroke(dp(2), 0xFFFFD98A);
+            borderBg.setColor(0x00000000);
+            if (borderView != null) borderView.setBackground(borderBg);
+            if (editHintView != null) editHintView.setText("BSD 预警编辑");
+            setupWindowEdgeHandle2(cropHandleL, "left");
+            setupWindowEdgeHandle2(cropHandleR, "right");
+            setupWindowEdgeHandle2(cropHandleT, "top");
+            setupWindowEdgeHandle2(cropHandleB, "bottom");
+            setupWindowCornerHandle2(cropHandleTL, "tl");
+            setupWindowCornerHandle2(cropHandleTR, "tr");
+            setupWindowCornerHandle2(cropHandleBL, "bl");
+            setupWindowCornerHandle2(cropHandleBR, "br");
+
+            DisplayMetrics dm = new DisplayMetrics();
+            wm.getDefaultDisplay().getRealMetrics(dm);
+            SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+            // 窗口宽高：bsd_ 键优先，其次打灯对应键，最后默认
+            int defW = (int) (dm.widthPixels * OVERLAY_DEF_W_RATIO);
+            int defH = (int) (defW * 9f / 16f);
+            int w = prefs.getInt(bsdPrefix + "overlay_w",
+                    prefs.getInt(turnPrefix + "overlay_w", defW));
+            int h = prefs.getInt(bsdPrefix + "overlay_h",
+                    prefs.getInt(turnPrefix + "overlay_h", defH));
+            int minW = (int) (dm.widthPixels * MIN_SIZE_RATIO);
+            int minH = (int) (dm.heightPixels * MIN_SIZE_RATIO);
+            if (w < minW) w = minW;
+            if (w > dm.widthPixels) w = dm.widthPixels;
+            if (h < minH) h = minH;
+            if (h > dm.heightPixels) h = dm.heightPixels;
+            lp = new WindowManager.LayoutParams(
+                    w, h,
+                    WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                    WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                            | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
+                            | WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
+                    PixelFormat.TRANSLUCENT);
+            lp.gravity = Gravity.TOP | Gravity.START;
+            // 位置：bsd_ recorded 键优先，其次打灯 recorded 键，最后默认贴边
+            boolean bsdRec = prefs.getBoolean(bsdPrefix + "overlay_pos_recorded", false);
+            boolean turnRec = prefs.getBoolean(turnPrefix + "overlay_pos_recorded", false);
+            if (bsdRec) {
+                lp.x = prefs.getInt(bsdPrefix + "overlay_pos_x",
+                        "LEFT".equals(side) ? 120 : (dm.widthPixels - w - 120));
+                lp.y = prefs.getInt(bsdPrefix + "overlay_pos_y", dm.heightPixels - h - 120);
+            } else if (turnRec) {
+                lp.x = prefs.getInt(turnPrefix + "overlay_pos_x",
+                        "LEFT".equals(side) ? 120 : (dm.widthPixels - w - 120));
+                lp.y = prefs.getInt(turnPrefix + "overlay_pos_y", dm.heightPixels - h - 120);
+            } else {
+                lp.x = "LEFT".equals(side) ? 120 : (dm.widthPixels - w - 120);
+                lp.y = dm.heightPixels - h - 120;
+            }
+            // 画面配置：bsd_ 键优先，其次打灯对应键
+            camScale = prefs.getFloat(bsdPrefix + "cam_scale",
+                    prefs.getFloat(turnPrefix + "cam_scale", CAM_SCALE_DEFAULT));
+            panX = prefs.getFloat(bsdPrefix + "pan_x",
+                    prefs.getFloat(turnPrefix + "pan_x", 0f));
+            panY = prefs.getFloat(bsdPrefix + "pan_y",
+                    prefs.getFloat(turnPrefix + "pan_y", 0f));
+            clampCamScale();
+        }
+
+        void clampCamScale() {
+            if (camScale < CAM_SCALE_MIN) camScale = CAM_SCALE_MIN;
+            if (camScale > CAM_SCALE_MAX) camScale = CAM_SCALE_MAX;
+        }
+
+        void addToWindow() {
+            try {
+                wm.addView(rootView, lp);
+                makeDraggable2(rootView);
+                applyRenderTransform();
+            } catch (Exception e) {
+                Log.e(TAG, "BSD 编辑窗 addView failed side=" + side, e);
+            }
+        }
+
+        void removeFromWindow() {
+            try {
+                wm.removeView(rootView);
+            } catch (Exception ignored) {
+            }
+            // v1.54 beta6：移除即释放本窗 Surface（幂等），避免关闭编辑窗后 surface 占用残留
+            releaseSurface();
+        }
+
+        boolean isTargetReady() {
+            return textureView != null && textureView.isAvailable();
+        }
+
+        /** 将本窗 TextureView 的 Surface 加入预览输出目标列表（配合 createPreviewSession）。 */
+        void addSurfaceTarget(java.util.ArrayList<Surface> targets) {
+            if (textureView == null || !textureView.isAvailable()
+                    || textureView.getSurfaceTexture() == null) {
+                return;
+            }
+            if (editSurface != null) {
+                editSurface.release();
+                editSurface = null;
+            }
+            textureView.getSurfaceTexture().setDefaultBufferSize(BUFFER_W, BUFFER_H);
+            editSurface = new Surface(textureView.getSurfaceTexture());
+            targets.add(editSurface);
+        }
+
+        void releaseSurface() {
+            if (editSurface != null) {
+                editSurface.release();
+                editSurface = null;
+            }
+        }
+
+        private final TextureView.SurfaceTextureListener bsdEditSurfaceListener =
+                new TextureView.SurfaceTextureListener() {
+                    @Override
+                    public void onSurfaceTextureAvailable(SurfaceTexture st, int width, int height) {
+                        st.setDefaultBufferSize(BUFFER_W, BUFFER_H);
+                        applyRenderTransform();
+                        // v1.54 beta6：条件放宽为 cameraDevice 就绪即重建会话——createPreviewSession
+                        // 内部会聚合本编辑窗 surface 并在无目标时自动释放，避免编辑态独立预览时
+                        // 主窗纹理未就绪导致黑屏（surface 初始化时序修复）
+                        if (cameraDevice != null) {
+                            createPreviewSession();
+                        }
+                    }
+
+                    @Override
+                    public void onSurfaceTextureSizeChanged(SurfaceTexture st, int width, int height) {
+                        st.setDefaultBufferSize(BUFFER_W, BUFFER_H);
+                        applyRenderTransform();
+                    }
+
+                    @Override
+                    public boolean onSurfaceTextureDestroyed(SurfaceTexture st) {
+                        return true;
+                    }
+
+                    @Override
+                    public void onSurfaceTextureUpdated(SurfaceTexture st) {
+                    }
+                };
+
+        /** 保存本窗编辑配置到 bsd_ 前缀独立键（位置/大小/画面缩放/平移）。 */
+        void saveConfigInternal() {
+            SharedPreferences.Editor ed = getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit();
+            ed.putInt(bsdPrefix + "overlay_w", lp.width);
+            ed.putInt(bsdPrefix + "overlay_h", lp.height);
+            ed.putFloat(bsdPrefix + "cam_scale", camScale);
+            ed.putFloat(bsdPrefix + "pan_x", panX);
+            ed.putFloat(bsdPrefix + "pan_y", panY);
+            ed.putInt(bsdPrefix + "overlay_pos_x", lp.x);
+            ed.putInt(bsdPrefix + "overlay_pos_y", lp.y);
+            ed.putBoolean(bsdPrefix + "overlay_pos_recorded", true);
+            ed.apply();
+            serviceLog("BSD 预警编辑已保存 side=" + side + " w=" + lp.width + " h=" + lp.height
+                    + " camScale=" + camScale + " pan=(" + (int) panX + "," + (int) panY
+                    + ") pos=(" + lp.x + "," + lp.y + ")");
+        }
+
+        /** 从 prefs 重新加载配置（同步转向灯后立即刷新用）。 */
+        void reloadFromPrefs() {
+            SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+            DisplayMetrics dm = new DisplayMetrics();
+            wm.getDefaultDisplay().getRealMetrics(dm);
+            int defW = (int) (dm.widthPixels * OVERLAY_DEF_W_RATIO);
+            int defH = (int) (defW * 9f / 16f);
+            int w = prefs.getInt(bsdPrefix + "overlay_w",
+                    prefs.getInt(turnPrefix + "overlay_w", defW));
+            int h = prefs.getInt(bsdPrefix + "overlay_h",
+                    prefs.getInt(turnPrefix + "overlay_h", defH));
+            int minW = (int) (dm.widthPixels * MIN_SIZE_RATIO);
+            int minH = (int) (dm.heightPixels * MIN_SIZE_RATIO);
+            if (w < minW) w = minW;
+            if (w > dm.widthPixels) w = dm.widthPixels;
+            if (h < minH) h = minH;
+            if (h > dm.heightPixels) h = dm.heightPixels;
+            lp.width = w;
+            lp.height = h;
+            if (prefs.getBoolean(bsdPrefix + "overlay_pos_recorded", false)) {
+                lp.x = prefs.getInt(bsdPrefix + "overlay_pos_x", lp.x);
+                lp.y = prefs.getInt(bsdPrefix + "overlay_pos_y", lp.y);
+            }
+            camScale = prefs.getFloat(bsdPrefix + "cam_scale",
+                    prefs.getFloat(turnPrefix + "cam_scale", CAM_SCALE_DEFAULT));
+            panX = prefs.getFloat(bsdPrefix + "pan_x",
+                    prefs.getFloat(turnPrefix + "pan_x", 0f));
+            panY = prefs.getFloat(bsdPrefix + "pan_y",
+                    prefs.getFloat(turnPrefix + "pan_y", 0f));
+            clampCamScale();
+            try {
+                wm.updateViewLayout(rootView, lp);
+            } catch (Exception ignored) {
+            }
+            setEditMode2(editMode);
+        }
+
+        /** 编辑窗渲染：与主窗同构但使用 bsd_ 前缀独立键（未编辑 fitCenter 完整显示，编辑后自由平移）。 */
+        void applyRenderTransform() {
+            if (textureView == null) return;
+            int vw = lp.width;
+            int vh = lp.height;
+            if (vw <= 0) vw = 1;
+            if (vh <= 0) vh = 1;
+            DisplayMetrics dm = new DisplayMetrics();
+            wm.getDefaultDisplay().getRealMetrics(dm);
+            float defW = dm.widthPixels * OVERLAY_DEF_W_RATIO;
+            float defH = defW * 9f / 16f;
+            float cs = camScale;
+            clampCamScale();
+            cs = camScale;
+            float Wv = defW * cs;
+            float Hv = defH * cs;
+            float scale = Wv / BUFFER_W;
+            float dx;
+            float dy;
+            SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+            boolean defaultCrop = !prefs.contains(bsdPrefix + "cam_scale") && !editMode;
+            if (defaultCrop) {
+                float fit = Math.min(vw / Wv, vh / Hv);
+                scale = (Wv / BUFFER_W) * fit;
+                dx = (vw - Wv * fit) / 2f;
+                dy = (vh - Hv * fit) / 2f;
+            } else {
+                dx = (vw - Wv) / 2f + panX;
+                dy = (vh - Hv) / 2f + panY;
+            }
+            android.graphics.Matrix m = new android.graphics.Matrix();
+            m.reset();
+            m.postScale(scale, scale);
+            m.postTranslate(dx, dy);
+            textureView.setTransform(m);
+            serviceLog("BSD编辑窗RT side=" + side + " vw=" + vw + " vh=" + vh
+                    + " Wv=" + (int) Wv + " Hv=" + (int) Hv + " pan=(" + (int) panX + "," + (int) panY
+                    + ") scale=" + String.format("%.4f", scale));
+        }
+
+        void setEditMode2(boolean on) {
+            editMode = on;
+            if (borderView != null) borderView.setVisibility(on ? View.VISIBLE : View.GONE);
+            if (cropHandleL != null) cropHandleL.setVisibility(on ? View.VISIBLE : View.GONE);
+            if (cropHandleR != null) cropHandleR.setVisibility(on ? View.VISIBLE : View.GONE);
+            if (cropHandleT != null) cropHandleT.setVisibility(on ? View.VISIBLE : View.GONE);
+            if (cropHandleB != null) cropHandleB.setVisibility(on ? View.VISIBLE : View.GONE);
+            if (cropHandleTL != null) cropHandleTL.setVisibility(on ? View.VISIBLE : View.GONE);
+            if (cropHandleTR != null) cropHandleTR.setVisibility(on ? View.VISIBLE : View.GONE);
+            if (cropHandleBL != null) cropHandleBL.setVisibility(on ? View.VISIBLE : View.GONE);
+            if (cropHandleBR != null) cropHandleBR.setVisibility(on ? View.VISIBLE : View.GONE);
+            if (editHintView != null) {
+                editHintView.setText(on ? "BSD编辑 · 单指平移画面，双指缩放，拖边改形状" : "BSD 预警编辑");
+            }
+            if (on) applyRenderTransform();
+        }
+
+        /** 双击切换编辑模式：进入加载 bsd_ 键画面配置（从未编辑时以默认 1/4 裁切为基准），退出保存。 */
+        void toggleEditMode2() {
+            if (editMode) {
+                saveConfigInternal();
+                setEditMode2(false);
+                serviceLog("BSD 预警编辑模式退出，配置已保存 side=" + side);
+            } else {
+                SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+                camScale = prefs.getFloat(bsdPrefix + "cam_scale",
+                        prefs.getFloat(turnPrefix + "cam_scale", CAM_SCALE_DEFAULT));
+                panX = prefs.getFloat(bsdPrefix + "pan_x",
+                        prefs.getFloat(turnPrefix + "pan_x", 0f));
+                panY = prefs.getFloat(bsdPrefix + "pan_y",
+                        prefs.getFloat(turnPrefix + "pan_y", 0f));
+                // 从未编辑过（无 bsd_cam_scale 键）时，以默认左下/右下 1/4 裁切区域作为编辑初始值
+                if (!prefs.contains(bsdPrefix + "cam_scale")
+                        && !prefs.contains(turnPrefix + "cam_scale")) {
+                    DisplayMetrics dm = new DisplayMetrics();
+                    wm.getDefaultDisplay().getRealMetrics(dm);
+                    float defW = dm.widthPixels * OVERLAY_DEF_W_RATIO;
+                    float defH = defW * 9f / 16f;
+                    camScale = 2f;
+                    panX = "LEFT".equals(side) ? defW / 2f : -defW / 2f;
+                    panY = -defH / 2f;
+                }
+                clampCamScale();
+                setEditMode2(true);
+                serviceLog("BSD 预警编辑模式进入（" + side + "），双击保存退出");
+            }
+        }
+
+        /** BSD 编辑窗触摸：非编辑单指拖动位置（松手保存 bsd_ 键），编辑模式平移画面/双指缩放，双击切换。 */
+        void makeDraggable2(final View view) {
+            if (view == null) return;
+            view.setOnTouchListener(new View.OnTouchListener() {
+                private int downX;
+                private int downY;
+                private int initX;
+                private int initY;
+                private float initPanX;
+                private float initPanY;
+                private boolean dragging = false;
+                private long lastTapTime = 0L;
+                private boolean doubleTapConsumed = false;
+                private float startSpan = 0f;
+                private float startCamScale = 0f;
+                private boolean pinchActive = false;
+
+                @Override
+                public boolean onTouch(View v, MotionEvent event) {
+                    if (rootView == null) return false;
+                    switch (event.getActionMasked()) {
+                        case MotionEvent.ACTION_DOWN:
+                            downX = (int) event.getRawX();
+                            downY = (int) event.getRawY();
+                            initX = lp.x;
+                            initY = lp.y;
+                            initPanX = panX;
+                            initPanY = panY;
+                            dragging = false;
+                            pinchActive = false;
+                            long now = System.currentTimeMillis();
+                            if (now - lastTapTime < 400L) {
+                                lastTapTime = 0L;
+                                doubleTapConsumed = true;
+                                toggleEditMode2();
+                            } else {
+                                lastTapTime = 0L;
+                                doubleTapConsumed = false;
+                            }
+                            return true;
+                        case MotionEvent.ACTION_POINTER_DOWN:
+                            if (editMode && event.getPointerCount() >= 2) {
+                                pinchActive = true;
+                                dragging = false;
+                                startSpan = computeSpan(event);
+                                startCamScale = camScale;
+                            }
+                            return true;
+                        case MotionEvent.ACTION_MOVE:
+                            if (pinchActive && event.getPointerCount() >= 2) {
+                                float span = computeSpan(event);
+                                if (startSpan > 0f && span > 0f) {
+                                    float newScale = startCamScale * span / startSpan;
+                                    camScale = newScale;
+                                    clampCamScale();
+                                    applyRenderTransform();
+                                }
+                                return true;
+                            }
+                            if (editMode) {
+                                int dx = (int) event.getRawX() - downX;
+                                int dy = (int) event.getRawY() - downY;
+                                if (Math.abs(dx) > 4 || Math.abs(dy) > 4) {
+                                    dragging = true;
+                                }
+                                if (dragging) {
+                                    panX = initPanX + dx;
+                                    panY = initPanY + dy;
+                                    applyRenderTransform();
+                                }
+                                return true;
+                            }
+                            {
+                                int dx = (int) event.getRawX() - downX;
+                                int dy = (int) event.getRawY() - downY;
+                                if (Math.abs(dx) > 4 || Math.abs(dy) > 4) {
+                                    dragging = true;
+                                }
+                                if (dragging) {
+                                    lp.x = initX + dx;
+                                    lp.y = initY + dy;
+                                    try {
+                                        wm.updateViewLayout(rootView, lp);
+                                    } catch (Exception ignored) {
+                                    }
+                                }
+                                return true;
+                            }
+                        case MotionEvent.ACTION_UP:
+                        case MotionEvent.ACTION_CANCEL:
+                            if (pinchActive) {
+                                pinchActive = false;
+                                return true;
+                            }
+                            boolean wasDragging = dragging;
+                            dragging = false;
+                            if (wasDragging && !editMode) {
+                                // 拖动结束保存 bsd_ 键位置（不吸附，预警窗自由摆放）
+                                SharedPreferences.Editor ed = getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit();
+                                ed.putInt(bsdPrefix + "overlay_pos_x", lp.x);
+                                ed.putInt(bsdPrefix + "overlay_pos_y", lp.y);
+                                ed.putBoolean(bsdPrefix + "overlay_pos_recorded", true);
+                                ed.apply();
+                                serviceLog("BSD 预警编辑窗位置拖动自动保存 side=" + side + " pos=(" + lp.x + "," + lp.y + ")");
+                            }
+                            if (!wasDragging && !doubleTapConsumed) {
+                                lastTapTime = System.currentTimeMillis();
+                            }
+                            doubleTapConsumed = false;
+                            return wasDragging;
+                    }
+                    return false;
+                }
+            });
+        }
+
+        /** BSD 编辑窗边缘手柄：改变窗口形状（参照主窗 setupWindowEdgeHandle）。 */
+        void setupWindowEdgeHandle2(final View handle, final String sside) {
+            if (handle == null) return;
+            handle.setOnTouchListener(new View.OnTouchListener() {
+                private int startRaw = 0;
+                private int startW = 0;
+                private int startH = 0;
+                private int startX = 0;
+                private int startY = 0;
+
+                @Override
+                public boolean onTouch(View v, MotionEvent event) {
+                    if (!editMode) return false;
+                    switch (event.getActionMasked()) {
+                        case MotionEvent.ACTION_DOWN:
+                            startW = lp.width;
+                            startH = lp.height;
+                            startX = lp.x;
+                            startY = lp.y;
+                            boolean horizontal = "left".equals(sside) || "right".equals(sside);
+                            startRaw = horizontal ? (int) event.getRawX() : (int) event.getRawY();
+                            return true;
+                        case MotionEvent.ACTION_MOVE:
+                            boolean h = "left".equals(sside) || "right".equals(sside);
+                            int cur = h ? (int) event.getRawX() : (int) event.getRawY();
+                            int d = cur - startRaw;
+                            DisplayMetrics dm = new DisplayMetrics();
+                            wm.getDefaultDisplay().getRealMetrics(dm);
+                            int minW = (int) (dm.widthPixels * MIN_SIZE_RATIO);
+                            int minH = (int) (dm.heightPixels * MIN_SIZE_RATIO);
+                            if ("left".equals(sside)) {
+                                int newW = startW - d;
+                                if (newW < minW) newW = minW;
+                                if (newW > dm.widthPixels) newW = dm.widthPixels;
+                                lp.width = newW;
+                                lp.x = startX + (startW - newW);
+                                if (lp.x < 0) {
+                                    lp.x = 0;
+                                    lp.width = startX + startW;
+                                }
+                            } else if ("right".equals(sside)) {
+                                int newW = startW + d;
+                                if (newW < minW) newW = minW;
+                                if (newW > dm.widthPixels) newW = dm.widthPixels;
+                                lp.width = newW;
+                            } else if ("top".equals(sside)) {
+                                int newH = startH - d;
+                                if (newH < minH) newH = minH;
+                                if (newH > dm.heightPixels) newH = dm.heightPixels;
+                                lp.height = newH;
+                                lp.y = startY + (startH - newH);
+                                if (lp.y < 0) {
+                                    lp.y = 0;
+                                    lp.height = startY + startH;
+                                }
+                            } else {
+                                int newH = startH + d;
+                                if (newH < minH) newH = minH;
+                                if (newH > dm.heightPixels) newH = dm.heightPixels;
+                                lp.height = newH;
+                            }
+                            try {
+                                wm.updateViewLayout(rootView, lp);
+                            } catch (Exception ignored) {
+                            }
+                            applyRenderTransform();
+                            return true;
+                        case MotionEvent.ACTION_UP:
+                        case MotionEvent.ACTION_CANCEL:
+                            return true;
+                    }
+                    return false;
+                }
+            });
+        }
+
+        /** BSD 编辑窗四角等比例缩放手柄（参照主窗 setupWindowCornerHandle）。 */
+        void setupWindowCornerHandle2(final View handle, final String corner) {
+            if (handle == null) return;
+            handle.setOnTouchListener(new View.OnTouchListener() {
+                private int startRawX = 0;
+                private int startRawY = 0;
+                private int startW = 0;
+                private int startH = 0;
+                private int startX = 0;
+                private int startY = 0;
+
+                @Override
+                public boolean onTouch(View v, MotionEvent event) {
+                    if (!editMode) return false;
+                    switch (event.getActionMasked()) {
+                        case MotionEvent.ACTION_DOWN:
+                            startRawX = (int) event.getRawX();
+                            startRawY = (int) event.getRawY();
+                            startW = lp.width;
+                            startH = lp.height;
+                            startX = lp.x;
+                            startY = lp.y;
+                            return true;
+                        case MotionEvent.ACTION_MOVE:
+                            int dx = (int) event.getRawX() - startRawX;
+                            int dy = (int) event.getRawY() - startRawY;
+                            DisplayMetrics dm = new DisplayMetrics();
+                            wm.getDefaultDisplay().getRealMetrics(dm);
+                            float ratio = (float) startW / startH;
+                            int newW = startW;
+                            int newH = startH;
+                            boolean horizontalDominant = Math.abs(dx) * startH >= Math.abs(dy) * startW;
+                            if (horizontalDominant) {
+                                if (corner.contains("r")) newW = startW + dx;
+                                else newW = startW - dx;
+                                newH = (int) (newW / ratio);
+                            } else {
+                                if (corner.contains("b")) newH = startH + dy;
+                                else newH = startH - dy;
+                                newW = (int) (newH * ratio);
+                            }
+                            if (newW < 1) newW = 1;
+                            if (newH < 1) newH = 1;
+                            int minW = (int) Math.max(dm.widthPixels * MIN_SIZE_RATIO,
+                                    dm.heightPixels * MIN_SIZE_RATIO * ratio);
+                            int maxW = (int) Math.min(dm.widthPixels, dm.heightPixels * ratio);
+                            if (newW < minW) newW = minW;
+                            if (newW > maxW) newW = maxW;
+                            newH = (int) (newW / ratio);
+                            if (newH < 1) newH = 1;
+                            lp.width = newW;
+                            lp.height = newH;
+                            if ("tl".equals(corner)) {
+                                lp.x = startX + startW - newW;
+                                lp.y = startY + startH - newH;
+                            } else if ("tr".equals(corner)) {
+                                lp.x = startX;
+                                lp.y = startY + startH - newH;
+                            } else if ("bl".equals(corner)) {
+                                lp.x = startX + startW - newW;
+                                lp.y = startY;
+                            } else { // br
+                                lp.x = startX;
+                                lp.y = startY;
+                            }
+                            if (lp.x < 0) {
+                                int rightEdge = startX + startW;
+                                lp.x = 0;
+                                lp.width = rightEdge;
+                                lp.height = (int) (rightEdge / ratio);
+                                lp.y = ("tl".equals(corner) || "tr".equals(corner))
+                                        ? (startY + startH - lp.height) : startY;
+                            }
+                            if (lp.y < 0) {
+                                int bottomEdge = startY + startH;
+                                lp.y = 0;
+                                lp.height = bottomEdge;
+                                lp.width = (int) (bottomEdge * ratio);
+                                lp.x = ("tl".equals(corner) || "bl".equals(corner))
+                                        ? (startX + startW - lp.width) : startX;
+                            }
+                            try {
+                                wm.updateViewLayout(rootView, lp);
+                            } catch (Exception ignored) {
+                            }
+                            applyRenderTransform();
+                            return true;
+                        case MotionEvent.ACTION_UP:
+                        case MotionEvent.ACTION_CANCEL:
+                            return true;
+                    }
+                    return false;
+                }
+            });
+        }
+    }
+
+    /** v1.54 beta4：编辑预警浮窗按钮——未召唤时同时召唤左右预警编辑窗；已召唤时同时关闭并保存。 */
+    private void toggleBsdEditInternal() {
+        if (bsdEditActive) {
+            if (bsdEditLeft != null) {
+                bsdEditLeft.saveConfigInternal();
+                bsdEditLeft.removeFromWindow();
+                bsdEditLeft = null;
+            }
+            if (bsdEditRight != null) {
+                bsdEditRight.saveConfigInternal();
+                bsdEditRight.removeFromWindow();
+                bsdEditRight = null;
+            }
+            bsdEditActive = false;
+            // v1.54 beta6：编辑态独立启动的预览在退出时完整释放（closeCamera/releaseCamera
+            // 幂等），避免 camera 占用残留导致后续打不开
+            if (bsdEditPreviewActive) {
+                bsdEditPreviewActive = false;
+                releaseCamera();
+                if (savedDirectionBeforeEdit != null) {
+                    direction = savedDirectionBeforeEdit;
+                    savedDirectionBeforeEdit = null;
+                }
+            }
+            serviceLog("BSD 预警浮窗编辑已退出，两侧配置已保存");
+        } else {
+            bsdEditActive = true;
+            // 编辑期间关闭由 BSD 弹起的自动浮窗，避免与编辑窗重叠
+            releaseBsdAutoOverlay();
+            if (bsdEditLeft == null) {
+                bsdEditLeft = new BsdEditWindow("LEFT");
+                bsdEditLeft.addToWindow();
+            }
+            if (bsdEditRight == null) {
+                bsdEditRight = new BsdEditWindow("RIGHT");
+                bsdEditRight.addToWindow();
+            }
+            // v1.54 beta6：编辑窗 addView 后立即按对应侧 cameraId 打开摄像头预览并保持。
+            // 已有相机在屏（打灯/BSD/手动浮窗）则复用并重建会话聚合编辑窗画面；
+            // 否则以左侧 bsd_left_camera_id（回退 left_camera_id）独立启动一路预览，
+            // 左右编辑窗作为同一路输出目标，编辑期间持续保持实时画面。
+            if (cameraDevice != null) {
+                createPreviewSession();
+            } else {
+                savedDirectionBeforeEdit = direction;
+                direction = "LEFT";
+                bsdEditPreviewActive = true;
+                openCamera();
+                // 编辑窗 surface 若尚未就绪，onOpened -> hasAnyPreviewTarget 暂不建会话，
+                // 由 bsdEditSurfaceListener.onSurfaceTextureAvailable 在纹理就绪后补建
+            }
+            serviceLog("BSD 预警浮窗编辑已进入：左右预警窗可拖动/双击编辑，再点按钮或点✕关闭保存");
+        }
+    }
+
+    /** v1.54 beta4：预警浮窗同步转向灯浮窗——左对左、右对右复制位置/大小/画面 pan 缩放。
+     * v1.54 beta5：同步范围增加 camera_id（left_camera_id -> bsd_left_camera_id、
+     * right_camera_id -> bsd_right_camera_id），保证预警浮窗画面与转向灯浮窗使用同一摄像头。 */
+    private void syncBsdToTurnInternal() {
+        SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+        SharedPreferences.Editor ed = prefs.edit();
+        String[] from = new String[]{"left_", "right_"};
+        String[] to = new String[]{"bsd_left_", "bsd_right_"};
+        String[] keys = new String[]{"overlay_w", "overlay_h", "overlay_pos_x", "overlay_pos_y",
+                "cam_scale", "pan_x", "pan_y", "camera_id"};
+        for (int i = 0; i < from.length; i++) {
+            for (String k : keys) {
+                if (prefs.contains(from[i] + k)) {
+                    if ("overlay_pos_x".equals(k) || "overlay_pos_y".equals(k)) {
+                        ed.putInt(to[i] + k, prefs.getInt(from[i] + k, 0));
+                    } else if ("overlay_w".equals(k) || "overlay_h".equals(k)) {
+                        ed.putInt(to[i] + k, prefs.getInt(from[i] + k, 0));
+                    } else if ("camera_id".equals(k)) {
+                        ed.putString(to[i] + k, prefs.getString(from[i] + k, "8"));
+                    } else {
+                        ed.putFloat(to[i] + k, prefs.getFloat(from[i] + k, 0f));
+                    }
+                }
+            }
+            ed.putBoolean(to[i] + "overlay_pos_recorded", true);
+        }
+        ed.apply();
+        if (bsdEditLeft != null) bsdEditLeft.reloadFromPrefs();
+        if (bsdEditRight != null) bsdEditRight.reloadFromPrefs();
+        serviceLog("BSD 预警浮窗已同步转向灯浮窗配置（左对左/右对右：位置/大小/画面/cameraId）");
+    }
+
+    /** v1.54 beta4：单独关闭某侧 BSD 预警编辑窗并保存该侧配置（编辑窗右上角 ✕）。 */
+    private void closeBsdEditWindowInternal(String side) {
+        if ("LEFT".equals(side) && bsdEditLeft != null) {
+            bsdEditLeft.saveConfigInternal();
+            bsdEditLeft.removeFromWindow();
+            bsdEditLeft = null;
+            serviceLog("BSD 左预警编辑窗已单独关闭并保存");
+        } else if ("RIGHT".equals(side) && bsdEditRight != null) {
+            bsdEditRight.saveConfigInternal();
+            bsdEditRight.removeFromWindow();
+            bsdEditRight = null;
+            serviceLog("BSD 右预警编辑窗已单独关闭并保存");
+        }
+        if (bsdEditLeft == null && bsdEditRight == null) {
+            bsdEditActive = false;
+            // v1.54 beta6：最后一个编辑窗关闭后，若为编辑态独立启动的预览则完整释放
+            if (bsdEditPreviewActive) {
+                bsdEditPreviewActive = false;
+                releaseCamera();
+                if (savedDirectionBeforeEdit != null) {
+                    direction = savedDirectionBeforeEdit;
+                    savedDirectionBeforeEdit = null;
+                }
+            }
+        }
+    }
+
+    /** v1.54 beta4：BSD 左预警弹窗时应用用户编辑的 bsd_left_ 键（位置/大小/画面），未编辑时保持 beta3 现状。 */
+    private void applyBsdLeftConfigIfPresent() {
+        if (overlayView == null) return;
+        SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+        if (!prefs.contains("bsd_left_cam_scale")
+                && !prefs.contains("bsd_left_overlay_w")) {
+            return;
+        }
+        try {
+            WindowManager.LayoutParams lp = (WindowManager.LayoutParams) overlayView.getLayoutParams();
+            DisplayMetrics dm = new DisplayMetrics();
+            wm.getDefaultDisplay().getRealMetrics(dm);
+            int minW = (int) (dm.widthPixels * MIN_SIZE_RATIO);
+            int minH = (int) (dm.heightPixels * MIN_SIZE_RATIO);
+            int w = prefs.getInt("bsd_left_overlay_w", lp.width);
+            int h = prefs.getInt("bsd_left_overlay_h", lp.height);
+            if (w < minW) w = minW;
+            if (w > dm.widthPixels) w = dm.widthPixels;
+            if (h < minH) h = minH;
+            if (h > dm.heightPixels) h = dm.heightPixels;
+            lp.width = w;
+            lp.height = h;
+            if (prefs.getBoolean("bsd_left_overlay_pos_recorded", false)) {
+                lp.x = prefs.getInt("bsd_left_overlay_pos_x", lp.x);
+                lp.y = prefs.getInt("bsd_left_overlay_pos_y", lp.y);
+            }
+            wm.updateViewLayout(overlayView, lp);
+            applyBsdLeftRenderTransform();
+            serviceLog("BSD 左预警弹窗应用 bsd_left_ 自定义配置 w=" + w + " h=" + h);
+        } catch (Exception e) {
+            Log.e(TAG, "applyBsdLeftConfigIfPresent failed", e);
+        }
+    }
+
+    /** v1.54 beta4：BSD 左预警画面渲染——使用 bsd_left_ 独立键（含默认初始左下 1/4 裁切与编辑后的自由平移）。 */
+    private void applyBsdLeftRenderTransform() {
+        if (overlayView == null || textureView == null) return;
+        WindowManager.LayoutParams lp = (WindowManager.LayoutParams) overlayView.getLayoutParams();
+        int vw = lp.width;
+        int vh = lp.height;
+        if (vw <= 0) vw = 1;
+        if (vh <= 0) vh = 1;
+        DisplayMetrics dm = new DisplayMetrics();
+        wm.getDefaultDisplay().getRealMetrics(dm);
+        float defW = dm.widthPixels * OVERLAY_DEF_W_RATIO;
+        float defH = defW * 9f / 16f;
+        SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+        float cs = prefs.getFloat("bsd_left_cam_scale",
+                prefs.getFloat("left_cam_scale", CAM_SCALE_DEFAULT));
+        if (cs < CAM_SCALE_MIN) cs = CAM_SCALE_MIN;
+        if (cs > CAM_SCALE_MAX) cs = CAM_SCALE_MAX;
+        float Wv = defW * cs;
+        float Hv = defH * cs;
+        float scale = Wv / BUFFER_W;
+        float dx;
+        float dy;
+        boolean defaultCrop = !prefs.contains("bsd_left_cam_scale");
+        if (defaultCrop) {
+            float fit = Math.min(vw / Wv, vh / Hv);
+            scale = (Wv / BUFFER_W) * fit;
+            dx = (vw - Wv * fit) / 2f;
+            dy = (vh - Hv * fit) / 2f;
+        } else {
+            float panX = prefs.getFloat("bsd_left_pan_x",
+                    prefs.getFloat("left_pan_x", 0f));
+            float panY = prefs.getFloat("bsd_left_pan_y",
+                    prefs.getFloat("left_pan_y", 0f));
+            dx = (vw - Wv) / 2f + panX;
+            dy = (vh - Hv) / 2f + panY;
+        }
+        android.graphics.Matrix m = new android.graphics.Matrix();
+        m.reset();
+        m.postScale(scale, scale);
+        m.postTranslate(dx, dy);
+        textureView.setTransform(m);
+        serviceLog("BSD左窗RT vw=" + vw + " vh=" + vh + " Wv=" + (int) Wv + " Hv=" + (int) Hv
+                + " scale=" + String.format("%.4f", scale) + " dx=" + (int) dx + " dy=" + (int) dy);
     }
 
     @Override

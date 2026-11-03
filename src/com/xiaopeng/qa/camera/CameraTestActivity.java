@@ -34,12 +34,13 @@ import java.util.Collections;
 import java.util.List;
 
 /**
- * 摄像头实机测试页：枚举车机所有可读摄像头（ID/朝向/最大预览分辨率），
- * 支持上一台/下一台切换并实时预览，方便确认哪一路摄像头能真正打开。
- * 界面元素刻意放大，适配车机大屏（sw1333dp）。
+ * 摄像头实机测试页（v1.54 beta2）：
+ * - 左右并排两个视频预览窗（横向排列不重叠），每窗独立打开一路 cameraId 实时预览
+ * - 每窗底下可修改/选择该路 video 的 cameraId（输入框 + 应用按钮，列出 CameraManager 可用列表）
+ * - 预览区域高度 240dp -> 420dp，修复原预览窗比例太矮画面看不全的问题
+ * 保留 v1.54 能力：AVM 视角切换（3D/2D 前视/360 三分屏/自定义）、dump AVM 参数。
  */
-public class CameraTestActivity extends Activity
-        implements TextureView.SurfaceTextureListener, View.OnClickListener {
+public class CameraTestActivity extends Activity implements View.OnClickListener {
 
     private static final String TAG = "CameraAssist";
     private static final int REQ_CAMERA = 200;
@@ -48,11 +49,7 @@ public class CameraTestActivity extends Activity
     private static final int AVM_3D = 4;      // 3D 环视
     private static final int AVM_FRONT = 16;  // 2D 单路前视
     private static final int AVM_360 = 21;    // 360 三分屏
-    // 实车 dump 已确认真实结构：display-mode 由 setAvmDisplayMode(int) 写入；
-    // v1.27 起 switchAvmView 按 ①setAvmDisplayMode(int) ②set(String,int) ③私有 put(String,String) 三优先级反射写入
 
-    private TextureView textureView;
-    private TextView tvCamIndex;
     private Button btnBack;
     private Button btnAvm3d;
     private Button btnAvmFront;
@@ -60,7 +57,6 @@ public class CameraTestActivity extends Activity
     private Button btnDumpAvm;
     private EditText etAvmCustom;
     private Button btnAvmCustom;
-    // v1.41：移除路数列表、上一个/下一个、左右转向绑定按钮（转向灯绑定固定 display-mode=8，不再暴露配置）
     /** 当前 AVM 视角（-1 表示未知/未设置），用于按钮激活态高亮。 */
     private int currentAvmMode = -1;
 
@@ -70,12 +66,10 @@ public class CameraTestActivity extends Activity
 
     private String[] cameraIds;
     private final List<CamInfo> camInfos = new ArrayList<>();
-    private int currentIndex = 0;
 
-    private CameraDevice cameraDevice;
-    private CameraCaptureSession captureSession;
-    private Surface previewSurface;
-    private Size previewSize;
+    // ---- v1.54 beta2：双路独立预览窗 ----
+    private final PreviewWindow leftWindow = new PreviewWindow();
+    private final PreviewWindow rightWindow = new PreviewWindow();
 
     private static class CamInfo {
         final String id;
@@ -89,15 +83,28 @@ public class CameraTestActivity extends Activity
         }
     }
 
+    /** 一路独立的预览窗状态：预览控件 + 相机资源 + 监听回调。 */
+    private static class PreviewWindow {
+        TextureView textureView;
+        TextView tvInfo;
+        EditText etCamId;
+        Button btnApply;
+        String cameraId;                 // 当前 cameraId（字符串，车机可能非纯数字）
+        CameraDevice cameraDevice;
+        CameraCaptureSession captureSession;
+        Surface previewSurface;
+        Size previewSize;
+        SurfaceTextureListener surfaceListener;
+        CameraDevice.StateCallback deviceCallback;
+    }
+
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
-        Log.i(TAG, "CameraTestActivity onCreate");
+        Log.i(TAG, "CameraTestActivity onCreate (v1.54 beta2 dual preview)");
         setContentView(R.layout.activity_camera_test);
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
 
-        textureView = findViewById(R.id.test_texture);
-        tvCamIndex = findViewById(R.id.tv_cam_index);
         btnBack = findViewById(R.id.btn_back);
         btnAvm3d = findViewById(R.id.btn_avm_3d);
         btnAvmFront = findViewById(R.id.btn_avm_front);
@@ -106,12 +113,25 @@ public class CameraTestActivity extends Activity
         etAvmCustom = findViewById(R.id.et_avm_custom);
         btnAvmCustom = findViewById(R.id.btn_avm_custom);
 
+        // 双窗控件绑定
+        leftWindow.textureView = findViewById(R.id.test_texture_left);
+        leftWindow.tvInfo = findViewById(R.id.tv_cam_left_info);
+        leftWindow.etCamId = findViewById(R.id.et_cam_id_left);
+        leftWindow.btnApply = findViewById(R.id.btn_apply_left);
+
+        rightWindow.textureView = findViewById(R.id.test_texture_right);
+        rightWindow.tvInfo = findViewById(R.id.tv_cam_right_info);
+        rightWindow.etCamId = findViewById(R.id.et_cam_id_right);
+        rightWindow.btnApply = findViewById(R.id.btn_apply_right);
+
         btnBack.setOnClickListener(this);
         btnAvm3d.setOnClickListener(this);
         btnAvmFront.setOnClickListener(this);
         btnAvm360.setOnClickListener(this);
         btnDumpAvm.setOnClickListener(this);
         btnAvmCustom.setOnClickListener(this);
+        leftWindow.btnApply.setOnClickListener(this);
+        rightWindow.btnApply.setOnClickListener(this);
         updateAvmButtons();
 
         cameraManager = (CameraManager) getSystemService(CAMERA_SERVICE);
@@ -119,7 +139,13 @@ public class CameraTestActivity extends Activity
         bgThread.start();
         bgHandler = new Handler(bgThread.getLooper());
 
-        textureView.setSurfaceTextureListener(this);
+        // 每窗独立 SurfaceTextureListener / CameraDevice.StateCallback
+        leftWindow.surfaceListener = new SurfaceTextureListener(leftWindow);
+        rightWindow.surfaceListener = new SurfaceTextureListener(rightWindow);
+        leftWindow.textureView.setSurfaceTextureListener(leftWindow.surfaceListener);
+        rightWindow.textureView.setSurfaceTextureListener(rightWindow.surfaceListener);
+        leftWindow.deviceCallback = new DeviceStateCallback(leftWindow);
+        rightWindow.deviceCallback = new DeviceStateCallback(rightWindow);
 
         if (checkSelfPermission(Manifest.permission.CAMERA)
                 != PackageManager.PERMISSION_GRANTED) {
@@ -142,7 +168,7 @@ public class CameraTestActivity extends Activity
         }
     }
 
-    /** 枚举所有可读摄像头并展示列表，随后打开第一台。 */
+    /** 枚举所有可读摄像头（ID/朝向/最大预览分辨率），初始化双窗默认 cameraId 并打开预览。 */
     private void startTest() {
         try {
             cameraIds = cameraManager.getCameraIdList();
@@ -179,12 +205,43 @@ public class CameraTestActivity extends Activity
             }
         }
 
-        currentIndex = 0;
-        updateIndexLabel();
-        if (cameraIds.length > 0) {
-            openCamera(currentIndex);
+        // 可用 cameraId 列表展示（每窗信息行，含朝向/最大预览）
+        StringBuilder avail = new StringBuilder("可用 cameraId: ");
+        if (cameraIds.length == 0) {
+            avail.append("无");
+        } else {
+            for (int i = 0; i < camInfos.size(); i++) {
+                if (i > 0) avail.append(", ");
+                avail.append(camInfos.get(i).id)
+                        .append("(").append(facingName(camInfos.get(i).facing))
+                        .append(" ").append(camInfos.get(i).maxSize).append(")");
+            }
+        }
+        String availStr = avail.toString();
+
+        // 默认分配：左窗第一路，右窗第二路（仅一路时复用同一路）
+        String leftId = cameraIds.length > 0 ? cameraIds[0] : null;
+        String rightId = cameraIds.length > 1 ? cameraIds[1] : leftId;
+
+        initWindow(leftWindow, "左窗", leftId, availStr);
+        initWindow(rightWindow, "右窗", rightId, availStr);
+
+        if (leftId != null) {
+            openCameraFor(leftWindow);
         } else {
             Toast.makeText(this, "未发现可用摄像头", Toast.LENGTH_LONG).show();
+        }
+    }
+
+    /** 初始化单窗 UI 状态；cameraId 为 null 表示无可用摄像头。 */
+    private void initWindow(PreviewWindow win, String label, String camId, String availStr) {
+        if (camId != null) {
+            win.cameraId = camId;
+            win.etCamId.setText(camId);
+            win.tvInfo.setText(label + " cameraId=" + camId + "\n" + availStr);
+        } else {
+            win.cameraId = null;
+            win.tvInfo.setText(label + " cameraId: 无可用摄像头\n" + availStr);
         }
     }
 
@@ -201,15 +258,6 @@ public class CameraTestActivity extends Activity
         }
     }
 
-    private void updateIndexLabel() {
-        if (cameraIds == null || cameraIds.length == 0) {
-            tvCamIndex.setText("正在预览：无可用摄像头");
-        } else {
-            tvCamIndex.setText("正在预览：第 " + (currentIndex + 1) + " / " + cameraIds.length
-                    + " 台（ID " + camInfos.get(currentIndex).id + "）");
-        }
-    }
-
     @Override
     public void onClick(View v) {
         int id = v.getId();
@@ -223,12 +271,242 @@ public class CameraTestActivity extends Activity
             switchCustomAvmView();
         } else if (id == R.id.btn_dump_avm) {
             dumpAvmParameters();
+        } else if (id == R.id.btn_apply_left) {
+            applyCameraId(leftWindow, "左窗");
+        } else if (id == R.id.btn_apply_right) {
+            applyCameraId(rightWindow, "右窗");
         } else if (id == R.id.btn_back) {
             finish();
         }
     }
 
-    // v1.41：已删除 bindAvmRole/bindNow/saveAvmBinding/showCustomBindDialog 等转向绑定方法（绑定固定 display-mode=8）
+    /** 读取某窗输入框的 cameraId 并应用：校验合法性 -> 关闭旧相机 -> 重开新 cameraId 预览。 */
+    private void applyCameraId(PreviewWindow win, String label) {
+        if (win.etCamId == null || win.cameraId == null) return;
+        String s = win.etCamId.getText().toString().trim();
+        if (s.isEmpty()) {
+            Toast.makeText(this, label + "：请输入 cameraId", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        // 校验：必须在 CameraManager 可用列表内
+        boolean valid = false;
+        for (String cid : cameraIds) {
+            if (cid.equals(s)) {
+                valid = true;
+                break;
+            }
+        }
+        if (!valid) {
+            StringBuilder sb = new StringBuilder(label + "：cameraId 无效，可用列表: ");
+            for (int i = 0; i < cameraIds.length; i++) {
+                if (i > 0) sb.append(", ");
+                sb.append(cameraIds[i]);
+            }
+            Toast.makeText(this, sb.toString(), Toast.LENGTH_LONG).show();
+            return;
+        }
+        if (s.equals(win.cameraId)) {
+            Toast.makeText(this, label + "：cameraId 未变化，无需重开", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        win.cameraId = s;
+        win.tvInfo.setText(label + " cameraId=" + s + "（切换重开预览）");
+        closeCameraFor(win);
+        openCameraFor(win);
+    }
+
+    /** 独立打开某窗的摄像头。 */
+    private void openCameraFor(PreviewWindow win) {
+        if (win.cameraId == null) return;
+        closeCameraFor(win);
+        try {
+            cameraManager.openCamera(win.cameraId, win.deviceCallback, bgHandler);
+        } catch (CameraAccessException | SecurityException e) {
+            Log.e(TAG, "open camera failed id=" + win.cameraId, e);
+            Toast.makeText(this, "打开摄像头失败: ID " + win.cameraId, Toast.LENGTH_LONG).show();
+        }
+    }
+
+    private class DeviceStateCallback extends CameraDevice.StateCallback {
+        private final PreviewWindow win;
+
+        DeviceStateCallback(PreviewWindow win) {
+            this.win = win;
+        }
+
+        @Override
+        public void onOpened(CameraDevice device) {
+            win.cameraDevice = device;
+            if (win.textureView != null && win.textureView.isAvailable()) {
+                createPreviewSessionFor(win);
+            }
+        }
+
+        @Override
+        public void onDisconnected(CameraDevice device) {
+            device.close();
+            win.cameraDevice = null;
+        }
+
+        @Override
+        public void onError(CameraDevice device, int error) {
+            device.close();
+            win.cameraDevice = null;
+            Toast.makeText(CameraTestActivity.this,
+                    "摄像头打开出错: ID " + win.cameraId, Toast.LENGTH_LONG).show();
+        }
+    }
+
+    /** 从该摄像头的可用预览尺寸中选择：优先 16:9 且不超过 1920x1080，否则取最大。 */
+    private Size pickPreviewSize(String id) {
+        Size[] sizes = null;
+        try {
+            CameraCharacteristics ch = cameraManager.getCameraCharacteristics(id);
+            if (ch.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP) != null) {
+                sizes = ch.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+                        .getOutputSizes(SurfaceTexture.class);
+            }
+        } catch (CameraAccessException e) {
+            Log.e(TAG, "read sizes failed id=" + id, e);
+        }
+        if (sizes == null || sizes.length == 0) {
+            return new Size(1280, 720);
+        }
+        Size best169 = null;
+        Size largest = null;
+        for (Size s : sizes) {
+            if (largest == null || s.getWidth() * s.getHeight() > largest.getWidth() * largest.getHeight()) {
+                largest = s;
+            }
+            if (Math.abs(s.getWidth() * 9 - s.getHeight() * 16) <= s.getHeight()
+                    && s.getWidth() <= 1920) {
+                if (best169 == null || s.getWidth() > best169.getWidth()) {
+                    best169 = s;
+                }
+            }
+        }
+        return best169 != null ? best169 : largest;
+    }
+
+    /** 为指定窗创建预览会话（绑定该窗 TextureView Surface）。 */
+    private void createPreviewSessionFor(PreviewWindow win) {
+        if (win.cameraDevice == null || win.textureView == null) return;
+        try {
+            win.previewSize = pickPreviewSize(win.cameraId);
+            SurfaceTexture st = win.textureView.getSurfaceTexture();
+            if (st == null) return;
+            st.setDefaultBufferSize(win.previewSize.getWidth(), win.previewSize.getHeight());
+            if (win.previewSurface != null) {
+                win.previewSurface.release();
+                win.previewSurface = null;
+            }
+            win.previewSurface = new Surface(st);
+
+            final CaptureRequest.Builder builder =
+                    win.cameraDevice.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW);
+            builder.addTarget(win.previewSurface);
+            builder.set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO);
+
+            win.cameraDevice.createCaptureSession(Collections.singletonList(win.previewSurface),
+                    new CameraCaptureSession.StateCallback() {
+                        @Override
+                        public void onConfigured(CameraCaptureSession session) {
+                            win.captureSession = session;
+                            try {
+                                session.setRepeatingRequest(builder.build(), null, bgHandler);
+                            } catch (CameraAccessException e) {
+                                Log.e(TAG, "setRepeatingRequest failed", e);
+                            }
+                        }
+
+                        @Override
+                        public void onConfigureFailed(CameraCaptureSession session) {
+                            Log.e(TAG, "camera configure failed");
+                            Toast.makeText(CameraTestActivity.this,
+                                    "预览会话配置失败", Toast.LENGTH_LONG).show();
+                        }
+                    }, bgHandler);
+            configureTransformFor(win);
+        } catch (CameraAccessException e) {
+            Log.e(TAG, "createPreviewSessionFor failed", e);
+        }
+    }
+
+    /** 按屏幕旋转与传感器方向校正该窗预览画面，保证横屏显示正向。 */
+    private void configureTransformFor(PreviewWindow win) {
+        if (win.previewSize == null || win.textureView == null) return;
+        int rotation = getWindowManager().getDefaultDisplay().getRotation();
+        Matrix matrix = new Matrix();
+        RectF viewRect = new RectF(0, 0, win.textureView.getWidth(), win.textureView.getHeight());
+        RectF bufferRect = new RectF(0, 0, win.previewSize.getHeight(), win.previewSize.getWidth());
+        float centerX = viewRect.centerX();
+        float centerY = viewRect.centerY();
+        if (rotation == Surface.ROTATION_90 || rotation == Surface.ROTATION_270) {
+            bufferRect.offset(centerX - bufferRect.centerX(), centerY - bufferRect.centerY());
+            matrix.setRectToRect(viewRect, bufferRect, Matrix.ScaleToFit.FILL);
+            float scale = Math.max((float) viewRect.height() / win.previewSize.getHeight(),
+                    (float) viewRect.width() / win.previewSize.getWidth());
+            matrix.postScale(scale, scale, centerX, centerY);
+            matrix.postRotate(90 * (rotation - 2), centerX, centerY);
+        } else {
+            // 竖屏（手机测试）或 0 度：不旋转但按 cover 等比填满，避免画面拉伸变形
+            matrix.setRectToRect(viewRect, bufferRect, Matrix.ScaleToFit.FILL);
+            float scale = Math.max((float) viewRect.width() / win.previewSize.getWidth(),
+                    (float) viewRect.height() / win.previewSize.getHeight());
+            matrix.postScale(scale, scale, centerX, centerY);
+            if (rotation == Surface.ROTATION_180) {
+                matrix.postRotate(180, centerX, centerY);
+            }
+        }
+        win.textureView.setTransform(matrix);
+    }
+
+    /** 关闭指定窗的相机资源。 */
+    private void closeCameraFor(PreviewWindow win) {
+        if (win.captureSession != null) {
+            win.captureSession.close();
+            win.captureSession = null;
+        }
+        if (win.cameraDevice != null) {
+            win.cameraDevice.close();
+            win.cameraDevice = null;
+        }
+        if (win.previewSurface != null) {
+            win.previewSurface.release();
+            win.previewSurface = null;
+        }
+    }
+
+    // ---- TextureView.SurfaceTextureListener（每窗独立实例）----
+
+    private class SurfaceTextureListener implements TextureView.SurfaceTextureListener {
+        private final PreviewWindow win;
+
+        SurfaceTextureListener(PreviewWindow win) {
+            this.win = win;
+        }
+
+        @Override
+        public void onSurfaceTextureAvailable(SurfaceTexture st, int width, int height) {
+            if (win.cameraDevice != null) {
+                createPreviewSessionFor(win);
+            }
+        }
+
+        @Override
+        public void onSurfaceTextureSizeChanged(SurfaceTexture st, int width, int height) {
+        }
+
+        @Override
+        public boolean onSurfaceTextureDestroyed(SurfaceTexture st) {
+            closeCameraFor(win);
+            return true;
+        }
+
+        @Override
+        public void onSurfaceTextureUpdated(SurfaceTexture st) {
+        }
+    }
 
     /** 读取自定义视角输入框并下发 AVM 视角；非法输入 Toast 提示。 */
     private void switchCustomAvmView() {
@@ -533,187 +811,10 @@ public class CameraTestActivity extends Activity
         }
     }
 
-    // v1.41：已删除 switchCamera（上一个/下一个按钮一并移除）
-
-    private void openCamera(int index) {
-        closeCamera();
-        if (index < 0 || index >= cameraIds.length) return;
-        try {
-            cameraManager.openCamera(cameraIds[index], deviceCallback, bgHandler);
-        } catch (CameraAccessException | SecurityException e) {
-            Log.e(TAG, "open camera failed id=" + cameraIds[index], e);
-            Toast.makeText(this, "打开摄像头失败: ID " + cameraIds[index], Toast.LENGTH_LONG).show();
-        }
-    }
-
-    private final CameraDevice.StateCallback deviceCallback = new CameraDevice.StateCallback() {
-        @Override
-        public void onOpened(CameraDevice device) {
-            cameraDevice = device;
-            if (textureView != null && textureView.isAvailable()) {
-                createPreviewSession();
-            }
-        }
-
-        @Override
-        public void onDisconnected(CameraDevice device) {
-            device.close();
-            cameraDevice = null;
-        }
-
-        @Override
-        public void onError(CameraDevice device, int error) {
-            device.close();
-            cameraDevice = null;
-            Toast.makeText(CameraTestActivity.this,
-                    "摄像头打开出错: ID " + cameraIds[currentIndex], Toast.LENGTH_LONG).show();
-        }
-    };
-
-    /** 从该摄像头的可用预览尺寸中选择：优先 16:9 且不超过 1920x1080，否则取最大。 */
-    private Size pickPreviewSize(String id) {
-        Size[] sizes = null;
-        try {
-            CameraCharacteristics ch = cameraManager.getCameraCharacteristics(id);
-            if (ch.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP) != null) {
-                sizes = ch.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
-                        .getOutputSizes(SurfaceTexture.class);
-            }
-        } catch (CameraAccessException e) {
-            Log.e(TAG, "read sizes failed id=" + id, e);
-        }
-        if (sizes == null || sizes.length == 0) {
-            return new Size(1280, 720);
-        }
-        Size best169 = null;
-        Size largest = null;
-        for (Size s : sizes) {
-            if (largest == null || s.getWidth() * s.getHeight() > largest.getWidth() * largest.getHeight()) {
-                largest = s;
-            }
-            if (Math.abs(s.getWidth() * 9 - s.getHeight() * 16) <= s.getHeight()
-                    && s.getWidth() <= 1920) {
-                if (best169 == null || s.getWidth() > best169.getWidth()) {
-                    best169 = s;
-                }
-            }
-        }
-        return best169 != null ? best169 : largest;
-    }
-
-    private void createPreviewSession() {
-        if (cameraDevice == null || textureView == null) return;
-        try {
-            previewSize = pickPreviewSize(cameraIds[currentIndex]);
-            SurfaceTexture st = textureView.getSurfaceTexture();
-            if (st == null) return;
-            st.setDefaultBufferSize(previewSize.getWidth(), previewSize.getHeight());
-            if (previewSurface != null) {
-                previewSurface.release();
-                previewSurface = null;
-            }
-            previewSurface = new Surface(st);
-
-            final CaptureRequest.Builder builder =
-                    cameraDevice.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW);
-            builder.addTarget(previewSurface);
-            builder.set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO);
-
-            cameraDevice.createCaptureSession(Collections.singletonList(previewSurface),
-                    new CameraCaptureSession.StateCallback() {
-                        @Override
-                        public void onConfigured(CameraCaptureSession session) {
-                            captureSession = session;
-                            try {
-                                session.setRepeatingRequest(builder.build(), null, bgHandler);
-                            } catch (CameraAccessException e) {
-                                Log.e(TAG, "setRepeatingRequest failed", e);
-                            }
-                        }
-
-                        @Override
-                        public void onConfigureFailed(CameraCaptureSession session) {
-                            Log.e(TAG, "camera configure failed");
-                            Toast.makeText(CameraTestActivity.this,
-                                    "预览会话配置失败", Toast.LENGTH_LONG).show();
-                        }
-                    }, bgHandler);
-            configureTransform(textureView.getWidth(), textureView.getHeight());
-        } catch (CameraAccessException e) {
-            Log.e(TAG, "createPreviewSession failed", e);
-        }
-    }
-
-    /** 按屏幕旋转与传感器方向校正预览画面，保证横屏显示正向。 */
-    private void configureTransform(int viewWidth, int viewHeight) {
-        if (previewSize == null || textureView == null) return;
-        int rotation = getWindowManager().getDefaultDisplay().getRotation();
-        Matrix matrix = new Matrix();
-        RectF viewRect = new RectF(0, 0, viewWidth, viewHeight);
-        RectF bufferRect = new RectF(0, 0, previewSize.getHeight(), previewSize.getWidth());
-        float centerX = viewRect.centerX();
-        float centerY = viewRect.centerY();
-        if (rotation == Surface.ROTATION_90 || rotation == Surface.ROTATION_270) {
-            bufferRect.offset(centerX - bufferRect.centerX(), centerY - bufferRect.centerY());
-            matrix.setRectToRect(viewRect, bufferRect, Matrix.ScaleToFit.FILL);
-            float scale = Math.max((float) viewHeight / previewSize.getHeight(),
-                    (float) viewWidth / previewSize.getWidth());
-            matrix.postScale(scale, scale, centerX, centerY);
-            matrix.postRotate(90 * (rotation - 2), centerX, centerY);
-        } else {
-            // 竖屏（手机测试）或 0 度：不旋转但按 cover 等比填满，避免画面拉伸变形
-            matrix.setRectToRect(viewRect, bufferRect, Matrix.ScaleToFit.FILL);
-            float scale = Math.max((float) viewWidth / previewSize.getWidth(),
-                    (float) viewHeight / previewSize.getHeight());
-            matrix.postScale(scale, scale, centerX, centerY);
-            if (rotation == Surface.ROTATION_180) {
-                matrix.postRotate(180, centerX, centerY);
-            }
-        }
-        textureView.setTransform(matrix);
-    }
-
-    private void closeCamera() {
-        if (captureSession != null) {
-            captureSession.close();
-            captureSession = null;
-        }
-        if (cameraDevice != null) {
-            cameraDevice.close();
-            cameraDevice = null;
-        }
-        if (previewSurface != null) {
-            previewSurface.release();
-            previewSurface = null;
-        }
-    }
-
-    // ---- TextureView.SurfaceTextureListener ----
-
-    @Override
-    public void onSurfaceTextureAvailable(SurfaceTexture st, int width, int height) {
-        if (cameraDevice != null) {
-            createPreviewSession();
-        }
-    }
-
-    @Override
-    public void onSurfaceTextureSizeChanged(SurfaceTexture st, int width, int height) {
-    }
-
-    @Override
-    public boolean onSurfaceTextureDestroyed(SurfaceTexture st) {
-        closeCamera();
-        return true;
-    }
-
-    @Override
-    public void onSurfaceTextureUpdated(SurfaceTexture st) {
-    }
-
     @Override
     protected void onDestroy() {
-        closeCamera();
+        closeCameraFor(leftWindow);
+        closeCameraFor(rightWindow);
         if (bgThread != null) {
             bgThread.quitSafely();
         }

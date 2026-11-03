@@ -1,0 +1,10 @@
+P7_ViewAssist (P7全视影像) 自定义开源许可
+
+Copyright (c) Hades-Heyds. All rights reserved.
+
+1. 允许个人学习、研究与非商业用途使用；
+2. 禁止未经作者授权的商业转售、二次分发或倒卖行为；
+3. 任何分发、转载须保留本版权声明与本开源地址 https://github.com/Hades-Heyds/P7_ViewAssist；
+4. 本软件按“原样”（AS IS）提供，作者不对因使用本软件造成的任何直接或间接损失承担责任。
+
+详细声明见应用内“关于”与仓库 LICENSE 文件。

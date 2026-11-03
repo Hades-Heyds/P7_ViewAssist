@@ -86,35 +86,36 @@
         android:background="#66FFD98A"
         android:visibility="gone"/>
 
-    <!-- v1.51：四角等比例缩放手柄（24dp 方块贴角，默认 GONE，编辑模式显示，拖动等比例缩放） -->
+    <!-- v1.51：四角等比例缩放手柄（24dp 方块贴角，默认 GONE，编辑模式显示，拖动等比例缩放）
+         v1.54：编辑模式拖动/触控区域调大 3 倍（24dp -> 72dp），更易触达 -->
     <View
         android:id="@+id/handle_tl"
-        android:layout_width="24dp"
-        android:layout_height="24dp"
+        android:layout_width="72dp"
+        android:layout_height="72dp"
         android:layout_gravity="top|start"
         android:background="#66FFD98A"
         android:visibility="gone"/>
 
     <View
         android:id="@+id/handle_tr"
-        android:layout_width="24dp"
-        android:layout_height="24dp"
+        android:layout_width="72dp"
+        android:layout_height="72dp"
         android:layout_gravity="top|end"
         android:background="#66FFD98A"
         android:visibility="gone"/>
 
     <View
         android:id="@+id/handle_bl"
-        android:layout_width="24dp"
-        android:layout_height="24dp"
+        android:layout_width="72dp"
+        android:layout_height="72dp"
         android:layout_gravity="bottom|start"
         android:background="#66FFD98A"
         android:visibility="gone"/>
 
     <View
         android:id="@+id/handle_br"
-        android:layout_width="24dp"
-        android:layout_height="24dp"
+        android:layout_width="72dp"
+        android:layout_height="72dp"
         android:layout_gravity="bottom|end"
         android:background="#66FFD98A"
         android:visibility="gone"/>
